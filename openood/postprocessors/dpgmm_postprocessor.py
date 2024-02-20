@@ -13,6 +13,7 @@ import scipy
 
 
 MAX_SAMPLES = 10000
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 def compute_cov_cholesky(covariances, covariance_type):
@@ -350,6 +351,7 @@ class DPGMMPostprocessor(BasePostprocessor):
             all_feats = []
             all_labels = []
             with torch.no_grad():
+                i = 0
                 for batch in tqdm(id_loader_dict['train'],
                                   desc='Setup: ',
                                   position=0,
@@ -359,6 +361,9 @@ class DPGMMPostprocessor(BasePostprocessor):
                     # TODO: Only store sufficient stats to speed this up
                     all_feats.append(features.cpu())
                     all_labels.append(deepcopy(labels))
+                    if i >= 100:
+                        break
+                    i += 1
 
             all_feats = torch.cat(all_feats)
             all_labels = torch.cat(all_labels)
@@ -403,17 +408,27 @@ class DPGMMPostprocessor(BasePostprocessor):
                 temp = compute_cov_cholesky(SigmaN, self.covariance_type)
                 self.chol.append(temp)
             self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
-            self.chol = np.vstack(self.chol)  # shape [#classes, feature dim]
-            self.N = np.concatenate(self.N, 0)
+            self.chol = np.stack(self.chol, 0)  # shape [#classes, feature dim, feature dim]
+            self.N = np.array(self.N) # shape[#classes]
 
             # Sigma0 cholesky
             self.priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
 
             # sanity check on train acc
-            all_preds = self.py_x(all_feats)[:, :-1]
-            all_preds = all_preds.argmax(1)
-            train_acc = (all_preds == all_labels.numpy()).float().mean()
+            all_feats = all_feats.numpy()
+            bs = 1000
+            all_preds = np.empty(0,)
+            for batch_start in tqdm(range(0, all_feats.shape[0], bs)):
+                if batch_start + bs < all_feats.shape[0]:
+                    batch = all_feats[batch_start:batch_start+bs]
+                else:
+                    batch = all_feats[batch_start:]
+                preds = self.py_x(batch)[:, :-1]
+                preds = preds.argmax(1)
+                all_preds = np.concatenate((all_preds, preds), 0)
+            train_acc = (all_preds == all_labels.numpy()).astype(float).mean()
             print(f' Train acc: {train_acc:.2%}')
+            import pdb; pdb.set_trace()
 
             self.setup_flag = True
         else:
@@ -422,8 +437,10 @@ class DPGMMPostprocessor(BasePostprocessor):
     @torch.no_grad()
     def postprocess(self, net: nn.Module, data: Any):
         _, features = net(data, return_feature=True)
-        py_x = self.py_x(features.numpy())
+        py_x = self.py_x(features.cpu().numpy())
         id_probs = py_x[:,:-1]
         pred = id_probs.argmax(1)
         conf = py_x[:, -1]
+        pred = torch.tensor(pred, device=DEVICE)
+        conf = torch.tensor(conf, device=DEVICE)
         return pred, conf

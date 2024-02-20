@@ -3,7 +3,7 @@ import urllib.request
 
 from openood.postprocessors import (
     ASHPostprocessor, BasePostprocessor, ConfBranchPostprocessor, CutPastePostprocessor,
-    DICEPostprocessor, DRAEMPostprocessor, DropoutPostProcessor, DSVDDPostprocessor,
+    DICEPostprocessor, DPGMMPostprocessor, DRAEMPostprocessor, DropoutPostProcessor, DSVDDPostprocessor,
     EBOPostprocessor, EnsemblePostprocessor, GMMPostprocessor, GodinPostprocessor,
     GradNormPostprocessor, GRAMPostprocessor, KLMatchingPostprocessor, KNNPostprocessor,
     MaxLogitPostprocessor, MCDPostprocessor, MDSPostprocessor, MDSEnsemblePostprocessor,
@@ -18,6 +18,7 @@ postprocessors = {
     'ash': ASHPostprocessor,
     'cider': CIDERPostprocessor,
     'conf_branch': ConfBranchPostprocessor,
+    'dpgmm': DPGMMPostprocessor,
     'msp': BasePostprocessor,
     'ebo': EBOPostprocessor,
     'odin': ODINPostprocessor,
