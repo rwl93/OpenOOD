@@ -298,6 +298,129 @@ def multivariate_t_logpdf_full(x, df, mean, scale_tril):
     return out.squeeze()
 
 
+def multivariate_t_logpdf_torch(x, df, mean, chol, covariance_type):
+    if covariance_type == 'full':
+        return multivariate_t_logpdf_full_torch(x, df,  mean, chol)
+    elif covariance_type == 'tied':
+        raise NotImplementedError
+    else:
+        return multivariate_t_logpdf_diag_torch(x, df, mean, chol, covariance_type)
+
+def multivariate_t_logpdf_diag_torch(x, df, mean, chol, covariance_type):
+    # N: Batch dim; K: cluster dim; D: feature dim
+    # x = (N, D) or (D,)
+    # df = (K,)
+    # mean = (K,D) or (D,)
+    # chol =
+        # diag : (K,D) or (D)
+        # spherical : (K,) or float
+    df = torch.as_tensor(df)
+    if isinstance(chol, float) or chol.ndim == 0:
+        chol = torch.tensor([chol,])
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    N = x.shape[0]
+    if mean.ndim == 1:
+        mean = mean.unsqueeze(0) # (K,D)
+        chol = chol.unsqueeze(0) # (K,D) or (K,1)
+    if chol.ndim == 1:
+        chol = chol.unsqueeze(-1)
+    K = mean.shape[0]
+    D = mean.shape[-1]
+    # (K,D) or (K,1) => (K,)
+    halflogdet = torch.log(chol).sum(-1)
+    if covariance_type == 'spherical' and chol.shape[1] == 1:
+        halflogdet *= D
+
+    t = 0.5 * (df + D)
+    A = torch.special.gammaln(t)
+    B = torch.special.gammaln(0.5 * df)
+    C = D/2. * torch.log(df * torch.pi)
+
+    if N > MAX_SAMPLES and K > 1:
+        out = []
+        for k in range(K):
+            # float * ((((N,D) - (D)) / (D or 1)) ** 2) sumlast => (N)
+            maha = (((x - mean[k]) / chol[k]) ** 2).sum(-1)
+            maha = 1. + (1. / df[k]) * maha
+            outk = A[k] - B[k] - C[k] - halflogdet[k] - t[k] * torch.log(maha)
+            out.append(outk)
+        out = torch.stack(out).T
+    else:
+        x_NKD = x.view(N, 1, D).repeat(1, K, 1)
+        # float * (((N,K,D) - (K,D)) / (K, D or 1) ** 2) sumlast => (N,K)
+        maha = (((x_NKD - mean) / chol) ** 2).sum(-1)
+        maha = 1. + (1. / df) * maha
+
+        t = 0.5 * (df + D)
+        A = torch.special.gammaln(t)
+        B = torch.special.gammaln(0.5 * df)
+        C = D/2. * torch.log(df * torch.pi)
+        out = A - B - C - halflogdet - t * torch.log(maha)
+    return out.squeeze()
+
+def multivariate_t_logpdf_full_torch(x, df, mean, scale_tril):
+    """Compute the logpdf of a multivariate t distribution.
+
+    Parameters
+    ----------
+    x : FloatTensor
+        Batch of samples
+    mean : FloatTensor
+    scale_tril : FloatTensor
+        Lower Cholesky of the covariance.
+    df : int or Tensor
+    """
+    # N: Batch dim; K: cluster dim; D: feature dim
+    # x = (N, D) or (D,)
+    # mean = (K,D) or (D,)
+    # scale_tril =
+        # full : (K,D,D) or (D,D)
+        # diag : (K,D) or (D)
+        # spherical : (K,) or float
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    N = x.shape[0]
+    if mean.ndim == 1:
+        mean = mean.unsqueeze(0)
+        scale_tril = scale_tril.unsqueeze(0)
+    df = torch.as_tensor(df)
+    K = mean.shape[0]
+    D = mean.shape[-1]
+    halflogdet = torch.log(torch.diagonal(scale_tril, dim1=-2, dim2=-1)).sum(-1) # (K,)
+    t = 0.5 * (df + D)
+    A = torch.special.gammaln(t)
+    B = torch.special.gammaln(0.5 * df)
+    C = D/2. * torch.log(df * torch.pi)
+    if N > MAX_SAMPLES and K > 1:
+        out = []
+        for k in range(K):
+            # float * ((((N,D) - (D)) / (D or 1)) ** 2) sumlast => (N)
+            dev = x - mean[k]
+            dev = dev.T # (D, N)
+            maha = torch.linalg.solve_triangular(scale_tril[k], dev, upper=False)
+            maha = torch.square(maha).sum(0) # (N,)
+            maha = 1. + (1. / df[k]) * maha
+            outk = A[k] - B[k] - C[k] - halflogdet[k] - t[k] * maha.log()
+            out.append(outk)
+        out = torch.stack(out).T
+    else:
+        x_NKD = x.view(N, 1, D).repeat(1, K, 1)
+        # (N,K,D) - (K, D) = (N,K,D)
+        #  (N,K,n)
+        dev = x_NKD - mean
+        # (N,K,D)/(K,D,D)
+        dev_KDN = dev.permute(1,2,0)
+        maha = torch.linalg.solve_triangular(scale_tril, dev_KDN,  upper=False)
+        if maha.ndim == 3:
+            maha = torch.square(maha).sum(1).T # (N,K)
+        else:
+            maha = torch.square(maha).sum(0) # (N,)
+        maha = 1. + (1. / df) * maha
+        out = A - B - C - halflogdet - t * torch.log(maha)
+    return out.squeeze()
+
+
 class DPGMMPostprocessor(BasePostprocessor):
     def __init__(self, config):
         self.config = config
@@ -306,7 +429,7 @@ class DPGMMPostprocessor(BasePostprocessor):
         self.covariance_type = self.config.postprocessor.postprocessor_args.covariance_type
         self.alpha = self.config.postprocessor.postprocessor_args.alpha
 
-    def logpostpred(self, x):
+    def logpostpred(self, x, use_torch=False):
         nu_N = self.nu0 + self.N
         dim = x.shape[1]
         df = nu_N - dim + 1
@@ -320,13 +443,24 @@ class DPGMMPostprocessor(BasePostprocessor):
             st = self.chol * np.sqrt(factor)
         else:
             raise NotImplementedError
+        if use_torch:
+            df = torch.tensor(df, device=DEVICE)
+            meanN  = torch.tensor(self.meanN, device=DEVICE)
+            st = torch.tensor(st, device=DEVICE)
+            return multivariate_t_logpdf_torch(
+                x, df, meanN, st, self.covariance_type)
         return multivariate_t_logpdf(x, df, self.meanN, st, self.covariance_type)
 
-    def logpriorpred(self, x):
+    def logpriorpred(self, x, use_torch=False):
         dim = x.shape[1]
         df = self.nu0 - dim + 1
         factor = (self.kappa0 + 1) / (self.kappa0 * df)
         st = np.sqrt(factor) * self.priorchol
+        if use_torch:
+            df = torch.tensor(df, device=DEVICE)
+            mu0  = torch.tensor(self.mu0, device=DEVICE)
+            st = torch.tensor(st, device=DEVICE)
+            return multivariate_t_logpdf_torch(x, df, mu0, st, self.covariance_type)
         return multivariate_t_logpdf(x, df, self.mu0, st, self.covariance_type)
 
     def urn_coeff(self):
@@ -334,14 +468,20 @@ class DPGMMPostprocessor(BasePostprocessor):
         coeffs /= coeffs.sum()
         return coeffs
 
-    def py_x(self, x):
+    def py_x(self, x, use_torch=False):
         py = self.urn_coeff()
-        logpost = self.logpostpred(x)
-        logprior = self.logpriorpred(x)
-        logprior = np.expand_dims(logprior, -1)
-        logpx_y = np.concatenate((logpost, logprior), axis=-1)
-        logpy_x = logpx_y + np.log(py)
-        py_x = scipy.special.softmax(logpy_x, axis=-1)
+        logpost = self.logpostpred(x, use_torch=use_torch)
+        logprior = self.logpriorpred(x, use_torch=use_torch)
+        if use_torch:
+            logprior = logprior.unsqueeze(-1)
+            logpx_y = torch.cat((logpost, logprior), -1)
+            logpy_x = logpx_y + torch.log(torch.tensor(py, device=DEVICE))
+            py_x = torch.softmax(logpy_x, -1)
+        else:
+            logprior = np.expand_dims(logprior, -1)
+            logpx_y = np.concatenate((logpost, logprior), axis=-1)
+            logpy_x = logpx_y + np.log(py)
+            py_x = scipy.special.softmax(logpy_x, axis=-1)
         return py_x
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
@@ -415,21 +555,19 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
 
             # sanity check on train acc
-            all_feats = all_feats.numpy()
-            bs = 1000
-            all_preds = np.empty(0,)
-            for batch_start in tqdm(range(0, all_feats.shape[0], bs)):
-                if batch_start + bs < all_feats.shape[0]:
-                    batch = all_feats[batch_start:batch_start+bs]
-                else:
-                    batch = all_feats[batch_start:]
-                preds = self.py_x(batch)[:, :-1]
-                preds = preds.argmax(1)
-                all_preds = np.concatenate((all_preds, preds), 0)
-            train_acc = (all_preds == all_labels.numpy()).astype(float).mean()
-            print(f' Train acc: {train_acc:.2%}')
-            import pdb; pdb.set_trace()
-
+            # all_feats = all_feats.numpy()
+            # bs = 1000
+            # all_preds = np.empty(0,)
+            # for batch_start in tqdm(range(0, all_feats.shape[0], bs)):
+            #     if batch_start + bs < all_feats.shape[0]:
+            #         batch = all_feats[batch_start:batch_start+bs]
+            #     else:
+            #         batch = all_feats[batch_start:]
+            #     preds = self.py_x(batch)[:, :-1]
+            #     preds = preds.argmax(1)
+            #     all_preds = np.concatenate((all_preds, preds), 0)
+            # train_acc = (all_preds == all_labels.numpy()).astype(float).mean()
+            # print(f' Train acc: {train_acc:.2%}')
             self.setup_flag = True
         else:
             pass
@@ -437,10 +575,8 @@ class DPGMMPostprocessor(BasePostprocessor):
     @torch.no_grad()
     def postprocess(self, net: nn.Module, data: Any):
         _, features = net(data, return_feature=True)
-        py_x = self.py_x(features.cpu().numpy())
+        py_x = self.py_x(features, use_torch=True)
         id_probs = py_x[:,:-1]
         pred = id_probs.argmax(1)
-        conf = py_x[:, -1]
-        pred = torch.tensor(pred, device=DEVICE)
-        conf = torch.tensor(conf, device=DEVICE)
+        conf = - py_x[:, -1]
         return pred, conf
