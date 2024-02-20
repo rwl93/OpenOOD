@@ -1,0 +1,6 @@
+postprocessor:
+  name: dpgmm
+  APS_mode: False
+  postprocessor_args:
+    alpha: 1.
+    covariance_type: full
