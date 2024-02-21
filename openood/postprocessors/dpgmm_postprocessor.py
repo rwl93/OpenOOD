@@ -428,6 +428,8 @@ class DPGMMPostprocessor(BasePostprocessor):
         self.setup_flag = False
         self.covariance_type = self.config.postprocessor.postprocessor_args.covariance_type
         self.alpha = self.config.postprocessor.postprocessor_args.alpha
+        self.estimate_hyperprior = self.config.postprocessor.postprocessor_args.estimate_hyperprior
+        self.max_cls_conf = self.config.postprocessor.postprocessor_args.max_cls_conf
 
     def logpostpred(self, x, use_torch=False):
         nu_N = self.nu0 + self.N
@@ -491,7 +493,6 @@ class DPGMMPostprocessor(BasePostprocessor):
             all_feats = []
             all_labels = []
             with torch.no_grad():
-                i = 0
                 for batch in tqdm(id_loader_dict['train'],
                                   desc='Setup: ',
                                   position=0,
@@ -501,15 +502,15 @@ class DPGMMPostprocessor(BasePostprocessor):
                     # TODO: Only store sufficient stats to speed this up
                     all_feats.append(features.cpu())
                     all_labels.append(deepcopy(labels))
-                    if i >= 100:
-                        break
-                    i += 1
 
             all_feats = torch.cat(all_feats)
             all_labels = torch.cat(all_labels)
 
             dim = all_feats.shape[1]
-            self.Sigma0 = np.eye(dim)
+            if self.covariance_type=='full':
+                self.Sigma0 = np.eye(dim) * 10
+            elif self.covariance_type in ['diag', 'spherical']:
+                self.Sigma0 = np.ones((dim,))
             self.kappa0 = dim + 1
             self.nu0 = dim + 1
             self.mu0 = all_feats.numpy().mean(0)
@@ -518,6 +519,7 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.meanN = []
             self.chol = []
             self.N = []
+            all_SigmaN = []
             for c in range(self.num_classes):
                 class_samples = all_feats[all_labels.eq(c)].data.numpy()
                 self.N.append(class_samples.shape[0])
@@ -534,6 +536,7 @@ class DPGMMPostprocessor(BasePostprocessor):
                     SigmaN = self.Sigma0 + self.kappa0 * mu0outer
                     SigmaN += sumxx
                     SigmaN -= kappaN * np.outer(mN,  mN)
+                    all_SigmaN.append(SigmaN)
                 elif self.covariance_type in ['diag', 'spherical']:
                     sumxx = (class_samples ** 2).sum(0)
                     if self.covariance_type == 'spherical':
@@ -543,6 +546,7 @@ class DPGMMPostprocessor(BasePostprocessor):
                     SigmaN -= kappaN * (mN ** 2)
                     if self.covariance_type == 'spherical':
                         SigmaN.mean(-1)
+                    all_SigmaN.append(SigmaN)
                 else:
                     raise NotImplementedError
                 temp = compute_cov_cholesky(SigmaN, self.covariance_type)
@@ -552,6 +556,8 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.N = np.array(self.N) # shape[#classes]
 
             # Sigma0 cholesky
+            if self.estimate_hyperprior:
+                self.Sigma0 = np.stack(all_SigmaN, 0).mean(0)
             self.priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
 
             # sanity check on train acc
@@ -578,5 +584,8 @@ class DPGMMPostprocessor(BasePostprocessor):
         py_x = self.py_x(features, use_torch=True)
         id_probs = py_x[:,:-1]
         pred = id_probs.argmax(1)
-        conf = - py_x[:, -1]
+        if self.max_cls_conf:
+            conf = (py_x[:, :-1]).argmax(1)
+        else:
+            conf = - py_x[:, -1]
         return pred, conf

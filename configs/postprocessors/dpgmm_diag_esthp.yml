@@ -1,8 +1,8 @@
 postprocessor:
-  name: dpgmm
+  name: dpgmm_diag_esthp
   APS_mode: False
   postprocessor_args:
     alpha: 100.
-    covariance_type: full
-    estimate_hyperpriors: False
+    covariance_type: diag
+    estimate_hyperpriors: True
     max_cls_conf: False

@@ -1,5 +1,5 @@
 postprocessor:
-  name: dpgmm
+  name: dpgmm_full
   APS_mode: False
   postprocessor_args:
     alpha: 100.

@@ -1,8 +1,8 @@
 postprocessor:
-  name: dpgmm
+  name: dpgmm_spherical_mcc
   APS_mode: False
   postprocessor_args:
     alpha: 100.
-    covariance_type: full
+    covariance_type: spherical
     estimate_hyperpriors: False
-    max_cls_conf: False
+    max_cls_conf: True

@@ -6,6 +6,7 @@ from .cider_postprocessor import CIDERPostprocessor
 from .conf_branch_postprocessor import ConfBranchPostprocessor
 from .cutpaste_postprocessor import CutPastePostprocessor
 from .dice_postprocessor import DICEPostprocessor
+from .dpgmm_postprocessor import DPGMMPostprocessor
 from .draem_postprocessor import DRAEMPostprocessor
 from .dropout_postprocessor import DropoutPostProcessor
 from .dsvdd_postprocessor import DSVDDPostprocessor
@@ -69,6 +70,16 @@ def get_postprocessor(config: Config):
         'temperature_scaling': TemperatureScalingPostprocessor,
         'ensemble': EnsemblePostprocessor,
         'dropout': DropoutPostProcessor,
+        'dpgmm': DPGMMPostprocessor,
+        'dpgmm_full': DPGMMPostprocessor,
+        'dpgmm_diag': DPGMMPostprocessor,
+        'dpgmm_spherical': DPGMMPostprocessor,
+        'dpgmm_full_esthp': DPGMMPostprocessor,
+        'dpgmm_diag_esthp': DPGMMPostprocessor,
+        'dpgmm_spherical_esthp': DPGMMPostprocessor,
+        'dpgmm_full_mcc': DPGMMPostprocessor,
+        'dpgmm_diag_mcc': DPGMMPostprocessor,
+        'dpgmm_spherical_mcc': DPGMMPostprocessor,
         'draem': DRAEMPostprocessor,
         'dsvdd': DSVDDPostprocessor,
         'mos': MOSPostprocessor,
