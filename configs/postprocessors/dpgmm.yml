@@ -1,8 +1,14 @@
 postprocessor:
   name: dpgmm
-  APS_mode: False
+  APS_mode: True
   postprocessor_args:
-    alpha: 100.
-    covariance_type: full
-    estimate_hyperpriors: False
+    alpha: 1.
+    covariance_type: spherical
+    estimate_hyperprior: False
     max_cls_conf: False
+    sigma0_scale: 1.
+    kappa0: 1.
+  postprocessor_sweep:
+    estimate_hyperprior_list: [False, True]
+    sigma0_scale_list: [0.1, 1., 10., 100.]
+    kappa0_list: [1, 10, 100]

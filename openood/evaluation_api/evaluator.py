@@ -297,12 +297,16 @@ class Evaluator:
                                          ood_split='far',
                                          progress=progress)
 
+            # Don't overwrite accuracies with orig classifier acc
+            # if self.metrics[f'{id_name}_acc'] is None:
+            #     self.eval_acc(id_name)
+            # near_metrics[:, -1] = np.array([self.metrics[f'{id_name}_acc']] *
+            #                                len(near_metrics))
+            # far_metrics[:, -1] = np.array([self.metrics[f'{id_name}_acc']] *
+            #                               len(far_metrics))
+            # They should all be the same so chose first one.
             if self.metrics[f'{id_name}_acc'] is None:
-                self.eval_acc(id_name)
-            near_metrics[:, -1] = np.array([self.metrics[f'{id_name}_acc']] *
-                                           len(near_metrics))
-            far_metrics[:, -1] = np.array([self.metrics[f'{id_name}_acc']] *
-                                          len(far_metrics))
+                self.metrics[f'{id_name}_acc'] = near_metrics[0,-1]
 
             self.metrics[task] = pd.DataFrame(
                 np.concatenate([near_metrics, far_metrics], axis=0),

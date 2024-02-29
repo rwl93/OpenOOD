@@ -1,3 +1,4 @@
+import os
 from typing import Any
 from copy import deepcopy
 
@@ -363,7 +364,7 @@ def multivariate_t_logpdf_diag_torch(x, df, mean, chol, covariance_type):
         # spherical : (K,) or float
     df = torch.as_tensor(df)
     if isinstance(chol, float) or chol.ndim == 0:
-        chol = torch.tensor([chol,])
+        chol = torch.tensor([chol,], device=DEVICE)
     if x.ndim == 1:
         x = x.unsqueeze(0)
     N = x.shape[0]
@@ -473,10 +474,22 @@ class DPGMMPostprocessor(BasePostprocessor):
         self.config = config
         self.num_classes = num_classes_dict[self.config.dataset.name]
         self.setup_flag = False
-        self.covariance_type = self.config.postprocessor.postprocessor_args.covariance_type
-        self.alpha = self.config.postprocessor.postprocessor_args.alpha
-        self.estimate_hyperprior = self.config.postprocessor.postprocessor_args.estimate_hyperprior
-        self.max_cls_conf = self.config.postprocessor.postprocessor_args.max_cls_conf
+        self.args = self.config.postprocessor.postprocessor_args
+        self.covariance_type = self.args.covariance_type
+        self.alpha = self.args.alpha
+        self.estimate_hyperprior = self.args.estimate_hyperprior
+        self.max_cls_conf = self.args.max_cls_conf
+        self.sigma0_scale = self.args.sigma0_scale
+        self.kappa0 = self.args.kappa0
+        self.args_dict = self.config.postprocessor.postprocessor_sweep
+
+    def set_hyperparam(self, hyperparam: list):
+        self.estimate_hyperprior = hyperparam[0]
+        self.sigma0_scale = hyperparam[1]
+        self.kappa0 = hyperparam[2]
+
+    def get_hyperparam(self):
+        return [self.estimate_hyperprior, self.sigma0_scale, self.kappa0]
 
     def logpostpred(self, x, use_torch=False):
         nu_N = self.nu0 + self.N
@@ -537,29 +550,39 @@ class DPGMMPostprocessor(BasePostprocessor):
         if not self.setup_flag:
             # estimate mean and variance from training set
             print('\n Estimating cluster statistics from training set...')
-            all_feats = []
-            all_labels = []
-            with torch.no_grad():
-                for batch in tqdm(id_loader_dict['train'],
-                                  desc='Setup: ',
-                                  position=0,
-                                  leave=True):
-                    data, labels = batch['data'].cuda(), batch['label']
-                    logits, features = net(data, return_feature=True)
-                    # TODO: Only store sufficient stats to speed this up
-                    all_feats.append(features.cpu())
-                    all_labels.append(deepcopy(labels))
+            fname = 'vit-b-16-img1k-feats.pkl'
+            fname = os.path.join(os.getcwd(), fname)
+            if os.path.isfile(fname):
+                dat = torch.load(os.path.join(os.getcwd(), 'vit-b-16-img1k-feats.pkl'))
+                all_feats = dat['feats']
+                all_labels = dat['labels']
+            else:
+                all_feats = []
+                all_labels = []
+                with torch.no_grad():
+                    for batch in tqdm(id_loader_dict['train'],
+                                      desc='Setup: ',
+                                      position=0,
+                                      leave=True):
+                        data, labels = batch['data'].cuda(), batch['label']
+                        logits, features = net(data, return_feature=True)
+                        # TODO: Only store sufficient stats to speed this up
+                        all_feats.append(features.cpu())
+                        all_labels.append(deepcopy(labels))
 
-            all_feats = torch.cat(all_feats)
-            all_labels = torch.cat(all_labels)
+                all_feats = torch.cat(all_feats)
+                all_labels = torch.cat(all_labels)
+                print(f'Saving ViT-B/16 feats and labels to: {fname}')
+                torch.save({'feats': all_feats, 'labels': all_labels}, fname)
 
             dim = all_feats.shape[1]
             if self.covariance_type=='full':
-                self.Sigma0 = np.eye(dim) * 10
+                self.Sigma0 = np.eye(dim) * self.sigma0_scale
             elif self.covariance_type in ['diag', 'spherical']:
-                self.Sigma0 = np.ones((dim,))
-            self.kappa0 = dim + 1
+                # unitS0: self.Sigma0 = np.ones((dim,))
+                self.Sigma0 = np.ones((dim,)) * self.sigma0_scale
             self.nu0 = dim + 1
+            # self.mu0 = np.zeros(all_feats.shape[1])
             self.mu0 = all_feats.numpy().mean(0)
 
             # compute class-conditional statistics
@@ -592,7 +615,7 @@ class DPGMMPostprocessor(BasePostprocessor):
                     SigmaN += sumxx
                     SigmaN -= kappaN * (mN ** 2)
                     if self.covariance_type == 'spherical':
-                        SigmaN.mean(-1)
+                        SigmaN = SigmaN.mean(-1)
                     all_SigmaN.append(SigmaN)
                 else:
                     raise NotImplementedError
@@ -632,7 +655,7 @@ class DPGMMPostprocessor(BasePostprocessor):
         id_probs = py_x[:,:-1]
         pred = id_probs.argmax(1)
         if self.max_cls_conf:
-            conf = (py_x[:, :-1]).argmax(1)
+            conf = id_probs.max(1)[0]
         else:
             conf = - py_x[:, -1]
         return pred, conf
