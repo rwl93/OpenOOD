@@ -4,5 +4,6 @@ postprocessor:
   postprocessor_args:
     alpha: 100.
     covariance_type: spherical
-    estimate_hyperpriors: False
+    estimate_hyperprior: False
     max_cls_conf: True
+    sigma0_scale: 1.
