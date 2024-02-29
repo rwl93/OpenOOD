@@ -217,6 +217,105 @@ def multivariate_normal_logpdf_tied(x, mean, scale_tril):
     return out.squeeze()
 
 
+def multivariate_normal_logpdf_torch(x, mean, chol, covariance_type):
+    if covariance_type == 'full':
+        return multivariate_normal_logpdf_full_torch(x, mean, chol)
+    elif covariance_type == 'tied':
+        return multivariate_normal_logpdf_tied_torch(x, mean, chol)
+    else:
+        raise NotImplementedError
+
+def multivariate_normal_logpdf_full_torch(x, mean, scale_tril):
+    # N: Batch dim; K: cluster dim; D: feature dim
+    # x = (N, D) or (D,)
+    # mean = (K,D) or (D,)
+    # scale_tril =
+        # full : (K,D,D) or (D,D)
+        # diag : (K,D) or (D)
+        # spherical : (K,) or float
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    N = x.shape[0]
+    if mean.ndim == 1:
+        mean = mean.unsqueeze(0)
+        scale_tril = scale_tril.unsqueeze(0)
+    K = mean.shape[0]
+    D = mean.shape[-1]
+    halflogdet = torch.log(torch.diagonal(scale_tril, dim1=-2, dim2=-1)).sum(-1) # (K,)
+
+    if N > MAX_SAMPLES and K > 1:
+        out = []
+        for k in range(K):
+            #  (N,D)
+            dev = x - mean[k]
+            dev = dev.T # (D,N)
+            maha = torch.linalg.solve_triangular(scale_tril[k], dev,  upper=False)
+            maha = torch.square(maha).sum(0) # (N,)
+            maha *= 0.5
+            outk = -(D/2.) * torch.log(torch.tensor(2 * np.pi)) - halflogdet[k] - maha # (N,)
+            out.append(outk)
+        out = torch.stack(out).T
+    else:
+        x_NKD = x.view(N, 1, D).repeat(1, K, 1)
+        # (N,K,D) - (K, D) = (N,K,D)
+        #  (N,K,n)
+        dev = x_NKD - mean
+        # (N,K,D)/(K,D,D) dev_KDN = dev.permute(1,2,0)
+        maha = torch.linalg.solve_triangular(scale_tril, dev_KDN,  upper=False)
+        if maha.ndim == 3:
+            maha = torch.square(maha).sum(1).T # (N,K)
+        else:
+            maha = torch.square(maha).sum(0) # (N,)
+        maha *= 0.5
+        out = -(D/2.) * torch.log(torch.tensor(2 * np.pi)) - halflogdet - maha # (N, K)
+    return out.squeeze()
+
+def multivariate_normal_logpdf_tied_torch(x, mean, scale_tril):
+    # N: Batch dim; K: cluster dim; D: feature dim
+    # x = (N, D) or (D,)
+    # mean = (K,D) or (D,)
+    # scale_tril =
+        # full : (K,D,D) or (D,D)
+        # diag : (K,D) or (D)
+        # spherical : (K,) or float
+    if x.ndim == 1:
+        x = x.unsqueeze(0)
+    N = x.shape[0]
+    if mean.ndim == 1:
+        mean = mean.unsqueeze(0)
+    K = mean.shape[0]
+    D = mean.shape[-1]
+    halflogdet = torch.log(torch.diagonal(scale_tril, dim1=-2, dim2=-1)).sum(-1) # ()/float
+
+    if N > MAX_SAMPLES and K > 1:
+        out = []
+        for k in range(K):
+            #  (N,D)
+            dev = x - mean[k]
+            dev = dev.T # (D,N)
+            maha = torch.linalg.solve_triangular(scale_tril, dev,  upper=False)
+            maha = torch.square(maha).sum(0) # (N,)
+            maha *= 0.5
+            outk = -(D/2.) * torch.log(torch.tensor(2 * np.pi)) - halflogdet - maha # (N,)
+            out.append(outk)
+        out = torch.stack(out).T
+    else:
+        x_NKD = x.view(N,1,D).repeat(1,K,1)
+        # (N,K,D) - (K, D) = (N,K,D)
+        #  (N,K,n)
+        dev = x_NKD - mean
+        # (N,K,D)/(K,D,D)
+        dev_KDN = dev.permute(1,2,0)
+        maha = torch.linalg.solve_triangular(scale_tril, dev_KDN,  upper=False)
+        if maha.ndim == 3:
+            maha = torch.square(maha).sum(1).T # (N,K)
+        else:
+            maha = torch.square(maha).sum(0) # (N,)
+        maha *= 0.5
+        out = -(D/2.) * torch.log(torch.tensor(2 * np.pi)) - halflogdet - maha # (N, K)
+    return out.squeeze()
+
+
 def multivariate_t_pdf(x, df, mean, chol, covariance_type):
     return np.exp(multivariate_t_logpdf(x, df, mean, chol, covariance_type))
 
@@ -492,6 +591,13 @@ class DPGMMPostprocessor(BasePostprocessor):
         return [self.estimate_hyperprior, self.sigma0_scale, self.kappa0]
 
     def logpostpred(self, x, use_torch=False):
+        if self.covariance_type == 'tied':
+            if use_torch:
+                self.meanN  = torch.tensor(self.meanN, device=DEVICE)
+                chol = torch.tensor(self.chol, device=DEVICE)
+                return multivariate_normal_logpdf_torch(x, mu0, chol, self.covariance_type)
+            return multivariate_normal_logpdf(x, self.mu0, self.priorchol,
+                                              self.covariance_type)
         nu_N = self.nu0 + self.N
         dim = x.shape[1]
         df = nu_N - dim + 1
@@ -515,6 +621,15 @@ class DPGMMPostprocessor(BasePostprocessor):
 
     def logpriorpred(self, x, use_torch=False):
         dim = x.shape[1]
+        if self.covariance_type == 'tied':
+            if use_torch:
+                mu0  = torch.tensor(self.mu0, device=DEVICE)
+                chol = torch.tensor(self.priorchol, device=DEVICE)
+                return multivariate_normal_logpdf_torch(x, mu0, chol,
+                                                        self.covariance_type)
+            return multivariate_normal_logpdf(x, self.mu0, self.priorchol,
+                                              self.covariance_type)
+
         df = self.nu0 - dim + 1
         factor = (self.kappa0 + 1) / (self.kappa0 * df)
         st = np.sqrt(factor) * self.priorchol
@@ -576,7 +691,7 @@ class DPGMMPostprocessor(BasePostprocessor):
                 torch.save({'feats': all_feats, 'labels': all_labels}, fname)
 
             dim = all_feats.shape[1]
-            if self.covariance_type=='full':
+            if self.covariance_type in ['full', 'tied']:
                 self.Sigma0 = np.eye(dim) * self.sigma0_scale
             elif self.covariance_type in ['diag', 'spherical']:
                 # unitS0: self.Sigma0 = np.ones((dim,))
@@ -590,11 +705,13 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.chol = []
             self.N = []
             all_SigmaN = []
+            sample_means = []
             for c in range(self.num_classes):
                 class_samples = all_feats[all_labels.eq(c)].data.numpy()
                 self.N.append(class_samples.shape[0])
                 kappaN = self.kappa0 + self.N[-1]
                 sample_mean = class_samples.mean(0)
+                sample_means.append(sample_mean)
                 mN = (1. / kappaN) * (self.kappa0 * self.mu0
                                       + self.N[-1] * sample_mean)
                 self.meanN.append(mN)
@@ -607,6 +724,15 @@ class DPGMMPostprocessor(BasePostprocessor):
                     SigmaN += sumxx
                     SigmaN -= kappaN * np.outer(mN,  mN)
                     all_SigmaN.append(SigmaN)
+                elif self.covariance_type == 'tied':
+                    # Store stats
+                    sumxx = class_samples.T.dot(class_samples)
+                    for k in range(self.num_classes):
+                        mk = self.N[k] * sample_mean
+                        # FIXME(rwl93): This seems like a weird setting for muk
+                        SigmaN = sumxx - np.outer(mk, sample_mean) - np.outer(sample_mean, mk)
+                        SigmaN = SigmaN + self.N[k] * np.outer(sample_mean, sample_mean)
+                        all_SigmaN.append(SigmaN)
                 elif self.covariance_type in ['diag', 'spherical']:
                     sumxx = (class_samples ** 2).sum(0)
                     if self.covariance_type == 'spherical':
@@ -619,31 +745,39 @@ class DPGMMPostprocessor(BasePostprocessor):
                     all_SigmaN.append(SigmaN)
                 else:
                     raise NotImplementedError
-                temp = compute_cov_cholesky(SigmaN, self.covariance_type)
-                self.chol.append(temp)
+                if self.covariance_type != 'tied':
+                    temp = compute_cov_cholesky(SigmaN, self.covariance_type) # pyright: ignore
+                    self.chol.append(temp)
+            # Compute tied chol mean N etc
+            self.N = np.array(self.N) # shape[#classes]
+            if self.covariance_type == 'tied':
+                # Sigma = (1/nu_n - dim - 1) * (Psi0 + sum_K (
+                    # sumxx_k - sumx_k @ mu_k - mu_k @ sumx_k + mu_k @ mu_k))
+                factor = 1 / (self.nu0 + self.N.sum())
+                Psi0 = np.copy(self.Sigma0)
+                # Class-wise portion of Sigma calculated above
+                # Sigma = list(Sigma_portion_k of shape D,D)
+                Sigma = np.stack(all_SigmaN, 0).sum(0) # (K, D, D) -> (D,D)
+                Sigma += Psi0
+                Sigma0_inv = scipy.linalg.inv(self.Sigma0)
+                Sigma_inv = scipy.linalg.inv(factor * Sigma)
+                self.meanN = []
+                self.chol = []
+                for k in range(self.num_classes):
+                    Sk = scipy.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
+                    muk = Sigma0_inv @ self.mu0 + self.N[k] * Sigma_inv @ sample_means[k]
+                    self.meanN.append(Sk @ muk)
+                    SigmaN = Sk + factor * Sigma
+                    self.chol.append(compute_cov_cholesky(SigmaN, self.covariance_type))
             self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
             self.chol = np.stack(self.chol, 0)  # shape [#classes, feature dim, feature dim]
-            self.N = np.array(self.N) # shape[#classes]
 
             # Sigma0 cholesky
             if self.estimate_hyperprior:
                 self.Sigma0 = np.stack(all_SigmaN, 0).mean(0)
+            if self.covariance_type == 'tied':
+                self.Sigma0 = self.Sigma0 + Sigma # pyright: ignore
             self.priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
-
-            # sanity check on train acc
-            # all_feats = all_feats.numpy()
-            # bs = 1000
-            # all_preds = np.empty(0,)
-            # for batch_start in tqdm(range(0, all_feats.shape[0], bs)):
-            #     if batch_start + bs < all_feats.shape[0]:
-            #         batch = all_feats[batch_start:batch_start+bs]
-            #     else:
-            #         batch = all_feats[batch_start:]
-            #     preds = self.py_x(batch)[:, :-1]
-            #     preds = preds.argmax(1)
-            #     all_preds = np.concatenate((all_preds, preds), 0)
-            # train_acc = (all_preds == all_labels.numpy()).astype(float).mean()
-            # print(f' Train acc: {train_acc:.2%}')
             self.setup_flag = True
         else:
             pass
