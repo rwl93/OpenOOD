@@ -42,7 +42,7 @@ def compute_cov_cholesky(covariances, covariance_type):
         "or collapsed samples). Try to decrease the number of components, "
         "or increase reg_covar."
     )
-    if covariance_type == 'full':
+    if covariance_type == ['full', 'tied']:
         if covariances.ndim == 2:
             if covariances.shape[0] != covariances.shape[1]:
                 raise ValueError("Invalid covariance dimensions")
@@ -54,8 +54,6 @@ def compute_cov_cholesky(covariances, covariance_type):
                 cov_chol[k] = scipy.linalg.cholesky(covariance, lower=True)
         else:
             raise ValueError("Invalid covariance dimension")
-    elif covariance_type == 'tied':
-        cov_chol = scipy.linalg.cholesky(covariances, lower=True)
     else:
         if np.any(np.less_equal(covariances, 0.0)):
             raise ValueError(estimate_precision_error_message)
@@ -70,7 +68,7 @@ def multivariate_normal_logpdf(x, mean, chol, covariance_type):
     if covariance_type == 'full':
         return multivariate_normal_logpdf_full(x, mean, chol)
     elif covariance_type == 'tied':
-        raise NotImplementedError
+        return multivariate_normal_logpdf_tied(x, mean, chol)
     else:
         return multivariate_normal_logpdf_diag(x, mean, chol, covariance_type)
 
@@ -160,6 +158,55 @@ def multivariate_normal_logpdf_full(x, mean, scale_tril):
         maha = torch.linalg.solve_triangular(scale_tril_torch, dev_KDN_torch,  upper=False)
         maha = maha.numpy() # (K,D,N)
         # maha = scipy.linalg.solve_triangular(scale_tril, dev.T, lower=True).T
+        if maha.ndim == 3:
+            maha = np.square(maha).sum(1).T # (N,K)
+        else:
+            maha = np.square(maha).sum(0) # (N,)
+        maha *= 0.5
+        out = -(D/2.) * np.log(2 * np.pi) - halflogdet - maha # (N, K)
+    return out.squeeze()
+
+def multivariate_normal_logpdf_tied(x, mean, scale_tril):
+    # N: Batch dim; K: cluster dim; D: feature dim
+    # x = (N, D) or (D,)
+    # mean = (K,D) or (D,)
+    # scale_tril =
+        # full : (K,D,D) or (D,D)
+        # diag : (K,D) or (D)
+        # spherical : (K,) or float
+    if x.ndim == 1:
+        x = np.expand_dims(x, axis=0)
+    N = x.shape[0]
+    if mean.ndim == 1:
+        mean = np.expand_dims(mean, axis=0)
+    K = mean.shape[0]
+    D = mean.shape[-1]
+    halflogdet = np.log(np.diagonal(scale_tril, axis1=-2, axis2=-1)).sum(-1) # ()/float
+    scale_tril_torch = torch.tensor(scale_tril)
+
+    if N > MAX_SAMPLES and K > 1:
+        out = []
+        for k in range(K):
+            #  (N,D)
+            dev = x - mean[k]
+            dev = torch.tensor(dev).T # (D,N)
+            maha = torch.linalg.solve_triangular(scale_tril_torch, dev,  upper=False)
+            maha = maha.numpy() # (D,N)
+            maha = np.square(maha).sum(0) # (N,)
+            maha *= 0.5
+            outk = -(D/2.) * np.log(2 * np.pi) - halflogdet - maha # (N,)
+            out.append(outk)
+        out = np.array(out).T
+    else:
+        x_KND = np.broadcast_to(x, (K, N, D))
+        x_NKD = np.transpose(x_KND, (1, 0, 2))
+        # (N,K,D) - (K, D) = (N,K,D)
+        #  (N,K,n)
+        dev = x_NKD - mean
+        # (N,K,D)/(K,D,D)
+        dev_KDN_torch = torch.tensor(dev.transpose(1,2,0))
+        maha = torch.linalg.solve_triangular(scale_tril_torch, dev_KDN_torch,  upper=False)
+        maha = maha.numpy() # (K,D,N)
         if maha.ndim == 3:
             maha = np.square(maha).sum(1).T # (N,K)
         else:
