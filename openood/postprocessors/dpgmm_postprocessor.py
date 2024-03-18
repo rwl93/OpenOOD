@@ -709,7 +709,7 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.nu0 = dim + 1
             # self.mu0 = np.zeros(all_feats.shape[1])
             self.mu0 = all_feats.mean(0)
-            if self.covariance_type in ['full', 'tied'] and not self.hierarchical:
+            if self.covariance_type in ['full', 'tied']:
                 if self.sigma0_sample_cov:
                     # compute class-conditional statistics
                     centered_data = all_feats - self.mu0
@@ -804,7 +804,7 @@ class DPGMMPostprocessor(BasePostprocessor):
                 Sigma += Psi0
                 Sigma_mean = Sigma * factor
                 if self.hierarchical:
-                    epsilon = 0.001
+                    epsilon = 0.001 + dim
                     kappa = 0.001
                     sigmasq = 0.001
                     # Calculate Sigma0 given samples
@@ -815,8 +815,8 @@ class DPGMMPostprocessor(BasePostprocessor):
                     Psi_tick = sigmasq * np.eye(dim) + muk_outers.sum(0)
                     Psi_tick = Psi_tick - kappa_tick * np.outer(mu_tick, mu_tick)
                     # FIXME: This is problematic because nu_tick is not > dim+1
-                    # Sigma0_mean = Psi_tick / (nu_tick - dim - 1)
-                    Sigma0_mean = Psi_tick / (nu_tick - 1)
+                    Sigma0_mean = Psi_tick / (nu_tick - dim - 1)
+                    # Sigma0_mean = Psi_tick / (nu_tick - 1)
                 else:
                     Sigma0_mean = self.Sigma0
                 self.Sigma0 = Sigma0_mean + Sigma_mean
