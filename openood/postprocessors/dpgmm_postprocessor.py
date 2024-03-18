@@ -5,17 +5,21 @@ from copy import deepcopy
 import numpy as np
 import torch
 import torch.nn as nn
+import sklearn.covariance
 from tqdm import tqdm
 
 from .base_postprocessor import BasePostprocessor
 from .info import num_classes_dict
 
 import scipy
+from sklearn.decomposition import PCA
 
 
 MAX_SAMPLES = 10000
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def ispsd(x):
+    return (np.linalg.eigvals(x) >= 0.).all()
 
 def compute_cov_cholesky(covariances, covariance_type):
     """Compute the Cholesky decomposition of the covariances.
@@ -43,7 +47,7 @@ def compute_cov_cholesky(covariances, covariance_type):
         "or collapsed samples). Try to decrease the number of components, "
         "or increase reg_covar."
     )
-    if covariance_type == ['full', 'tied']:
+    if covariance_type in ['full', 'tied']:
         if covariances.ndim == 2:
             if covariances.shape[0] != covariances.shape[1]:
                 raise ValueError("Invalid covariance dimensions")
@@ -575,11 +579,14 @@ class DPGMMPostprocessor(BasePostprocessor):
         self.setup_flag = False
         self.args = self.config.postprocessor.postprocessor_args
         self.covariance_type = self.args.covariance_type
-        self.alpha = self.args.alpha
+        self.alpha = float(self.args.alpha)
         self.estimate_hyperprior = self.args.estimate_hyperprior
         self.max_cls_conf = self.args.max_cls_conf
         self.sigma0_scale = self.args.sigma0_scale
+        self.sigma0_sample_cov = self.args.sigma0_sample_cov
         self.kappa0 = self.args.kappa0
+        self.use_pca = self.args.use_pca
+        self.pca_dim = self.args.pca_dim
         self.args_dict = self.config.postprocessor.postprocessor_sweep
 
     def set_hyperparam(self, hyperparam: list):
@@ -593,10 +600,10 @@ class DPGMMPostprocessor(BasePostprocessor):
     def logpostpred(self, x, use_torch=False):
         if self.covariance_type == 'tied':
             if use_torch:
-                self.meanN  = torch.tensor(self.meanN, device=DEVICE)
+                meanN  = torch.tensor(self.meanN, device=DEVICE)
                 chol = torch.tensor(self.chol, device=DEVICE)
-                return multivariate_normal_logpdf_torch(x, mu0, chol, self.covariance_type)
-            return multivariate_normal_logpdf(x, self.mu0, self.priorchol,
+                return multivariate_normal_logpdf_torch(x, meanN, chol, self.covariance_type)
+            return multivariate_normal_logpdf(x, self.meanN, self.priorchol,
                                               self.covariance_type)
         nu_N = self.nu0 + self.N
         dim = x.shape[1]
@@ -653,18 +660,19 @@ class DPGMMPostprocessor(BasePostprocessor):
             logprior = logprior.unsqueeze(-1)
             logpx_y = torch.cat((logpost, logprior), -1)
             logpy_x = logpx_y + torch.log(torch.tensor(py, device=DEVICE))
-            py_x = torch.softmax(logpy_x, -1)
+            py_x = torch.log_softmax(logpy_x, -1)
         else:
             logprior = np.expand_dims(logprior, -1)
             logpx_y = np.concatenate((logpost, logprior), axis=-1)
             logpy_x = logpx_y + np.log(py)
-            py_x = scipy.special.softmax(logpy_x, axis=-1)
+            py_x = scipy.special.log_softmax(logpy_x, axis=-1)
         return py_x
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
             # estimate mean and variance from training set
-            print('\n Estimating cluster statistics from training set...')
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
             fname = 'vit-b-16-img1k-feats.pkl'
             fname = os.path.join(os.getcwd(), fname)
             if os.path.isfile(fname):
@@ -674,6 +682,7 @@ class DPGMMPostprocessor(BasePostprocessor):
             else:
                 all_feats = []
                 all_labels = []
+                all_preds = []
                 with torch.no_grad():
                     for batch in tqdm(id_loader_dict['train'],
                                       desc='Setup: ',
@@ -684,21 +693,48 @@ class DPGMMPostprocessor(BasePostprocessor):
                         # TODO: Only store sufficient stats to speed this up
                         all_feats.append(features.cpu())
                         all_labels.append(deepcopy(labels))
+                        all_preds.append(logits.argmax(1).cpu())
 
                 all_feats = torch.cat(all_feats)
                 all_labels = torch.cat(all_labels)
+                all_preds = torch.cat(all_preds)
                 print(f'Saving ViT-B/16 feats and labels to: {fname}')
-                torch.save({'feats': all_feats, 'labels': all_labels}, fname)
+                torch.save({'feats': all_feats, 'labels': all_labels, 'preds': all_preds}, fname)
+
+            all_feats = all_feats.numpy()
+            if self.use_pca:
+                self.pca = PCA(n_components=self.pca_dim).fit(all_feats)
+                all_feats = self.pca.transform(all_feats)
 
             dim = all_feats.shape[1]
-            if self.covariance_type in ['full', 'tied']:
-                self.Sigma0 = np.eye(dim) * self.sigma0_scale
-            elif self.covariance_type in ['diag', 'spherical']:
-                # unitS0: self.Sigma0 = np.ones((dim,))
-                self.Sigma0 = np.ones((dim,)) * self.sigma0_scale
             self.nu0 = dim + 1
             # self.mu0 = np.zeros(all_feats.shape[1])
-            self.mu0 = all_feats.numpy().mean(0)
+            self.mu0 = all_feats.mean(0)
+            if self.covariance_type in ['full', 'tied']:
+                if self.sigma0_sample_cov:
+                    # compute class-conditional statistics
+                    centered_data = all_feats - self.mu0
+                    empcov = sklearn.covariance.EmpiricalCovariance(
+                        assume_centered=False)
+                    empcov.fit(centered_data)
+                    # inverse of covariance
+                    self.Sigma0 = empcov.covariance_# precision_
+                else:
+                    self.Sigma0 = np.eye(dim) * self.sigma0_scale
+            elif self.covariance_type in ['diag', 'spherical']:
+                # unitS0: self.Sigma0 = np.ones((dim,))
+                if self.sigma0_sample_cov:
+                    # compute class-conditional statistics
+                    centered_data = all_feats - self.mu0
+                    empcov = sklearn.covariance.EmpiricalCovariance(
+                        assume_centered=False)
+                    empcov.fit(centered_data)
+                    # inverse of covariance
+                    self.Sigma0 = np.diag(empcov.covariance_) # precision_
+                    if self.covariance_type == 'spherical':
+                        self.Sigma0 = self.Sigma0.mean() * np.ones((dim,))
+                else:
+                    self.Sigma0 = np.ones((dim,)) * self.sigma0_scale
 
             # compute class-conditional statistics
             self.meanN = []
@@ -707,32 +743,40 @@ class DPGMMPostprocessor(BasePostprocessor):
             all_SigmaN = []
             sample_means = []
             for c in range(self.num_classes):
-                class_samples = all_feats[all_labels.eq(c)].data.numpy()
+                class_samples = all_feats[all_labels.eq(c)]
                 self.N.append(class_samples.shape[0])
                 kappaN = self.kappa0 + self.N[-1]
+                sumx = class_samples.sum(0)
                 sample_mean = class_samples.mean(0)
                 sample_means.append(sample_mean)
-                mN = (1. / kappaN) * (self.kappa0 * self.mu0
-                                      + self.N[-1] * sample_mean)
+                mN = (1. / kappaN) * (self.kappa0 * self.mu0 + sumx)
                 self.meanN.append(mN)
                 if self.covariance_type == 'full':
+                    eps = 1e-5 * np.eye(dim)
                     sumxx = class_samples.T.dot(class_samples)
                     # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
                     # because sqrt(factor) * chol(Sigma) = chol(factor * Sigma)
-                    mu0outer = np.outer(self.mu0, self.mu0)
+                    mu0outer = np.outer(self.mu0, self.mu0) + eps
+                    mNouter = np.outer(mN, mN)
                     SigmaN = self.Sigma0 + self.kappa0 * mu0outer
                     SigmaN += sumxx
-                    SigmaN -= kappaN * np.outer(mN,  mN)
+                    SigmaN -= kappaN * mNouter
+                    SigmaN += 4*eps
+                    if not ispsd(SigmaN):
+                        import pdb; pdb.set_trace()
                     all_SigmaN.append(SigmaN)
                 elif self.covariance_type == 'tied':
                     # Store stats
                     sumxx = class_samples.T.dot(class_samples)
-                    for k in range(self.num_classes):
-                        mk = self.N[k] * sample_mean
-                        # FIXME(rwl93): This seems like a weird setting for muk
-                        SigmaN = sumxx - np.outer(mk, sample_mean) - np.outer(sample_mean, mk)
-                        SigmaN = SigmaN + self.N[k] * np.outer(sample_mean, sample_mean)
-                        all_SigmaN.append(SigmaN)
+                    mk = self.N[c] * sample_mean
+                    # FIXME(rwl93): This seems like a weird setting for muk
+                    SigmaN = sumxx - np.outer(mk, sample_mean) - np.outer(sample_mean, mk)
+                    temp = self.N[c] * (
+                        np.outer(sample_mean, sample_mean) +
+                        np.eye(dim) * 1e-5 # Avoid precision errors
+                    )
+                    SigmaN = SigmaN + temp
+                    all_SigmaN.append(SigmaN)
                 elif self.covariance_type in ['diag', 'spherical']:
                     sumxx = (class_samples ** 2).sum(0)
                     if self.covariance_type == 'spherical':
@@ -759,6 +803,9 @@ class DPGMMPostprocessor(BasePostprocessor):
                 # Sigma = list(Sigma_portion_k of shape D,D)
                 Sigma = np.stack(all_SigmaN, 0).sum(0) # (K, D, D) -> (D,D)
                 Sigma += Psi0
+                self.Sigma0 = self.Sigma0 + factor * Sigma # pyright: ignore
+                print("Sigma0 for debugging")
+                print(self.Sigma0)
                 Sigma0_inv = scipy.linalg.inv(self.Sigma0)
                 Sigma_inv = scipy.linalg.inv(factor * Sigma)
                 self.meanN = []
@@ -769,14 +816,14 @@ class DPGMMPostprocessor(BasePostprocessor):
                     self.meanN.append(Sk @ muk)
                     SigmaN = Sk + factor * Sigma
                     self.chol.append(compute_cov_cholesky(SigmaN, self.covariance_type))
+                print("final SigmaN for debugging")
+                print(SigmaN)
             self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
             self.chol = np.stack(self.chol, 0)  # shape [#classes, feature dim, feature dim]
 
             # Sigma0 cholesky
-            if self.estimate_hyperprior:
+            if self.estimate_hyperprior and self.covariance_type != 'tied':
                 self.Sigma0 = np.stack(all_SigmaN, 0).mean(0)
-            if self.covariance_type == 'tied':
-                self.Sigma0 = self.Sigma0 + Sigma # pyright: ignore
             self.priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
             self.setup_flag = True
         else:
@@ -785,6 +832,9 @@ class DPGMMPostprocessor(BasePostprocessor):
     @torch.no_grad()
     def postprocess(self, net: nn.Module, data: Any):
         _, features = net(data, return_feature=True)
+        if self.use_pca:
+            features = self.pca.transform(features.cpu().numpy())
+            features = torch.tensor(features).to(DEVICE)
         py_x = self.py_x(features, use_torch=True)
         id_probs = py_x[:,:-1]
         pred = id_probs.argmax(1)

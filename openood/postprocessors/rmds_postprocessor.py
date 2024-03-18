@@ -6,38 +6,53 @@ import torch
 import torch.nn as nn
 import sklearn.covariance
 from tqdm import tqdm
+import os
 
 from .base_postprocessor import BasePostprocessor
 from .info import num_classes_dict
 
+COV_ESTIMATOR={
+    'emp': sklearn.covariance.EmpiricalCovariance,
+    'oas': sklearn.covariance.OAS,
+    'lw': sklearn.covariance.LedoitWolf,
+}
 
 class RMDSPostprocessor(BasePostprocessor):
     def __init__(self, config):
         self.config = config
         self.num_classes = num_classes_dict[self.config.dataset.name]
         self.setup_flag = False
+        self.cov_estimator = config.postprocessor.postprocessor_args.cov_estimator
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
             # estimate mean and variance from training set
             print('\n Estimating mean and variance from training set...')
-            all_feats = []
-            all_labels = []
-            all_preds = []
-            with torch.no_grad():
-                for batch in tqdm(id_loader_dict['train'],
-                                  desc='Setup: ',
-                                  position=0,
-                                  leave=True):
-                    data, labels = batch['data'].cuda(), batch['label']
-                    logits, features = net(data, return_feature=True)
-                    all_feats.append(features.cpu())
-                    all_labels.append(deepcopy(labels))
-                    all_preds.append(logits.argmax(1).cpu())
+            fname = 'vit-b-16-img1k-feats.pkl'
+            fname = os.path.join(os.getcwd(), fname)
+            if os.path.isfile(fname):
+                dat = torch.load(os.path.join(os.getcwd(), 'vit-b-16-img1k-feats.pkl'))
+                all_feats = dat['feats']
+                all_labels = dat['labels']
+                all_preds = dat['preds']
+            else:
+                all_feats = []
+                all_labels = []
+                all_preds = []
+                with torch.no_grad():
+                    for batch in tqdm(id_loader_dict['train'],
+                                      desc='Setup: ',
+                                      position=0,
+                                      leave=True):
+                        data, labels = batch['data'].cuda(), batch['label']
+                        logits, features = net(data, return_feature=True)
+                        all_feats.append(features.cpu())
+                        all_labels.append(deepcopy(labels))
+                        all_preds.append(logits.argmax(1).cpu())
 
-            all_feats = torch.cat(all_feats)
-            all_labels = torch.cat(all_labels)
-            all_preds = torch.cat(all_preds)
+                all_feats = torch.cat(all_feats)
+                all_labels = torch.cat(all_labels)
+                all_preds = torch.cat(all_preds)
             # sanity check on train acc
             train_acc = all_preds.eq(all_labels).float().mean()
             print(f' Train acc: {train_acc:.2%}')
@@ -54,20 +69,24 @@ class RMDSPostprocessor(BasePostprocessor):
             self.class_mean = torch.stack(
                 self.class_mean)  # shape [#classes, feature dim]
 
-            group_lasso = sklearn.covariance.EmpiricalCovariance(
+            # group_lasso = sklearn.covariance.EmpiricalCovariance(
+            #     assume_centered=False)
+            covest = COV_ESTIMATOR[self.cov_estimator](
                 assume_centered=False)
-            group_lasso.fit(
+            covest.fit(
                 torch.cat(centered_data).cpu().numpy().astype(np.float32))
             # inverse of covariance
-            self.precision = torch.from_numpy(group_lasso.precision_).float()
+            self.precision = torch.from_numpy(covest.precision_).float()
 
             self.whole_mean = all_feats.mean(0)
             centered_data = all_feats - self.whole_mean.view(1, -1)
-            group_lasso = sklearn.covariance.EmpiricalCovariance(
+            # group_lasso = sklearn.covariance.EmpiricalCovariance(
+            #     assume_centered=False)
+            covest = COV_ESTIMATOR[self.cov_estimator](
                 assume_centered=False)
-            group_lasso.fit(centered_data.cpu().numpy().astype(np.float32))
+            covest.fit(centered_data.cpu().numpy().astype(np.float32))
             self.whole_precision = torch.from_numpy(
-                group_lasso.precision_).float()
+                covest.precision_).float()
             self.setup_flag = True
         else:
             pass

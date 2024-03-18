@@ -1,13 +1,13 @@
 postprocessor:
-  name: dpgmm_full
+  name: dpgmm_tied
   APS_mode: False
   postprocessor_args:
-    alpha: 1.
-    covariance_type: full
+    alpha: 1e-200
+    covariance_type: tied
     estimate_hyperprior: False
     max_cls_conf: False
     sigma0_scale: 1.
-    sigma0_sample_cov: True
-    kappa0: 1
-    use_pca: True
+    sigma0_sample_cov: False
+    kappa0: 1.
+    use_pca: False
     pca_dim: 128

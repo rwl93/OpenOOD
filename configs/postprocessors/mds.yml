@@ -1,3 +1,5 @@
 postprocessor:
   name: mds
   APS_mode: False
+  postprocessor_args:
+      cov_estimator: 'emp'

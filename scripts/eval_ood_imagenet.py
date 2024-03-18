@@ -45,6 +45,7 @@ parser.add_argument('--save-csv', action='store_true')
 parser.add_argument('--save-score', action='store_true')
 parser.add_argument('--fsood', action='store_true')
 parser.add_argument('--batch-size', default=200, type=int)
+parser.add_argument('--noshuffle', default=False, action='store_true')
 args = parser.parse_args()
 
 if not args.tvs_pretrained:
@@ -139,9 +140,8 @@ evaluator = Evaluator(
     preprocessor=preprocessor,  # default preprocessing
     postprocessor_name=postprocessor_name,
     postprocessor=postprocessor,
-    batch_size=args.
-    batch_size,  # for certain methods the results can be slightly affected by batch size
-    shuffle=True,
+    batch_size=args.batch_size,  # for certain methods the results can be slightly affected by batch size
+    shuffle=(not args.noshuffle), # Don't shuffle so that I can plot histograms
     num_workers=8)
 
 # load pre-computed scores if exists

@@ -7,6 +7,7 @@ postprocessor:
     estimate_hyperprior: False
     max_cls_conf: False
     sigma0_scale: 1.
+    sigma0_sample_cov: True
     kappa0: 1.
   postprocessor_sweep:
     estimate_hyperprior_list: [False, True]

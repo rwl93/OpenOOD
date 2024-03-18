@@ -1,3 +1,5 @@
 postprocessor:
   name: rmds
   APS_mode: False
+  postprocessor_args:
+      cov_estimator: 'emp'

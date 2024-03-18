@@ -80,6 +80,7 @@ def get_postprocessor(config: Config):
         'dpgmm_full_mcc': DPGMMPostprocessor,
         'dpgmm_diag_mcc': DPGMMPostprocessor,
         'dpgmm_spherical_mcc': DPGMMPostprocessor,
+        'dpgmm_tied': DPGMMPostprocessor,
         'draem': DRAEMPostprocessor,
         'dsvdd': DSVDDPostprocessor,
         'mos': MOSPostprocessor,
