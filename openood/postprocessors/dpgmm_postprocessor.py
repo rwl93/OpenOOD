@@ -580,22 +580,21 @@ class DPGMMPostprocessor(BasePostprocessor):
         self.args = self.config.postprocessor.postprocessor_args
         self.covariance_type = self.args.covariance_type
         self.alpha = float(self.args.alpha)
-        self.estimate_hyperprior = self.args.estimate_hyperprior
         self.max_cls_conf = self.args.max_cls_conf
         self.sigma0_scale = self.args.sigma0_scale
         self.sigma0_sample_cov = self.args.sigma0_sample_cov
         self.kappa0 = self.args.kappa0
         self.use_pca = self.args.use_pca
         self.pca_dim = self.args.pca_dim
+        self.hierarchical = self.args.hierarchical
         self.args_dict = self.config.postprocessor.postprocessor_sweep
 
     def set_hyperparam(self, hyperparam: list):
-        self.estimate_hyperprior = hyperparam[0]
         self.sigma0_scale = hyperparam[1]
         self.kappa0 = hyperparam[2]
 
     def get_hyperparam(self):
-        return [self.estimate_hyperprior, self.sigma0_scale, self.kappa0]
+        return [self.sigma0_scale, self.kappa0]
 
     def logpostpred(self, x, use_torch=False):
         if self.covariance_type == 'tied':
@@ -710,7 +709,7 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.nu0 = dim + 1
             # self.mu0 = np.zeros(all_feats.shape[1])
             self.mu0 = all_feats.mean(0)
-            if self.covariance_type in ['full', 'tied']:
+            if self.covariance_type in ['full', 'tied'] and not self.hierarchical:
                 if self.sigma0_sample_cov:
                     # compute class-conditional statistics
                     centered_data = all_feats - self.mu0
@@ -742,14 +741,15 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.N = []
             all_SigmaN = []
             sample_means = []
+            # Collect all class sufficient stats
             for c in range(self.num_classes):
                 class_samples = all_feats[all_labels.eq(c)]
                 self.N.append(class_samples.shape[0])
                 kappaN = self.kappa0 + self.N[-1]
-                sumx = class_samples.sum(0)
+                mk = class_samples.sum(0)
                 sample_mean = class_samples.mean(0)
                 sample_means.append(sample_mean)
-                mN = (1. / kappaN) * (self.kappa0 * self.mu0 + sumx)
+                mN = (1. / kappaN) * (self.kappa0 * self.mu0 + mk)
                 self.meanN.append(mN)
                 if self.covariance_type == 'full':
                     eps = 1e-5 * np.eye(dim)
@@ -768,7 +768,6 @@ class DPGMMPostprocessor(BasePostprocessor):
                 elif self.covariance_type == 'tied':
                     # Store stats
                     sumxx = class_samples.T.dot(class_samples)
-                    mk = self.N[c] * sample_mean
                     # FIXME(rwl93): This seems like a weird setting for muk
                     SigmaN = sumxx - np.outer(mk, sample_mean) - np.outer(sample_mean, mk)
                     temp = self.N[c] * (
@@ -797,24 +796,41 @@ class DPGMMPostprocessor(BasePostprocessor):
             if self.covariance_type == 'tied':
                 # Sigma = (1/nu_n - dim - 1) * (Psi0 + sum_K (
                     # sumxx_k - sumx_k @ mu_k - mu_k @ sumx_k + mu_k @ mu_k))
-                factor = 1 / (self.nu0 + self.N.sum())
-                Psi0 = np.copy(self.Sigma0)
+                factor = 1 / (self.nu0 + self.N.sum() - dim - 1)
+                Psi0 = np.copy(self.Sigma0) # FIXME: What is a good setting for this?
                 # Class-wise portion of Sigma calculated above
                 # Sigma = list(Sigma_portion_k of shape D,D)
                 Sigma = np.stack(all_SigmaN, 0).sum(0) # (K, D, D) -> (D,D)
                 Sigma += Psi0
-                self.Sigma0 = self.Sigma0 + factor * Sigma # pyright: ignore
+                Sigma_mean = Sigma * factor
+                if self.hierarchical:
+                    epsilon = 0.001
+                    kappa = 0.001
+                    sigmasq = 0.001
+                    # Calculate Sigma0 given samples
+                    nu_tick = epsilon + self.num_classes
+                    kappa_tick = kappa + self.num_classes
+                    mu_tick = (1 / kappa_tick) * np.stack(sample_means).sum(0)
+                    muk_outers = np.stack([np.outer(s, s) for s in sample_means])
+                    Psi_tick = sigmasq * np.eye(dim) + muk_outers.sum(0)
+                    Psi_tick = Psi_tick - kappa_tick * np.outer(mu_tick, mu_tick)
+                    # FIXME: This is problematic because nu_tick is not > dim+1
+                    # Sigma0_mean = Psi_tick / (nu_tick - dim - 1)
+                    Sigma0_mean = Psi_tick / (nu_tick - 1)
+                else:
+                    Sigma0_mean = self.Sigma0
+                self.Sigma0 = Sigma0_mean + Sigma_mean
                 print("Sigma0 for debugging")
                 print(self.Sigma0)
-                Sigma0_inv = scipy.linalg.inv(self.Sigma0)
-                Sigma_inv = scipy.linalg.inv(factor * Sigma)
+                Sigma0_inv = scipy.linalg.inv(Sigma0_mean)
+                Sigma_inv = scipy.linalg.inv(Sigma_mean)
                 self.meanN = []
                 self.chol = []
                 for k in range(self.num_classes):
                     Sk = scipy.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
                     muk = Sigma0_inv @ self.mu0 + self.N[k] * Sigma_inv @ sample_means[k]
                     self.meanN.append(Sk @ muk)
-                    SigmaN = Sk + factor * Sigma
+                    SigmaN = Sk + Sigma_mean
                     self.chol.append(compute_cov_cholesky(SigmaN, self.covariance_type))
                 print("final SigmaN for debugging")
                 print(SigmaN)
@@ -822,8 +838,6 @@ class DPGMMPostprocessor(BasePostprocessor):
             self.chol = np.stack(self.chol, 0)  # shape [#classes, feature dim, feature dim]
 
             # Sigma0 cholesky
-            if self.estimate_hyperprior and self.covariance_type != 'tied':
-                self.Sigma0 = np.stack(all_SigmaN, 0).mean(0)
             self.priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
             self.setup_flag = True
         else:

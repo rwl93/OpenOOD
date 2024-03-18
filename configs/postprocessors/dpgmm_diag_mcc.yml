@@ -1,9 +1,0 @@
-postprocessor:
-  name: dpgmm_diag_mcc
-  APS_mode: False
-  postprocessor_args:
-    alpha: 100.
-    covariance_type: diag
-    estimate_hyperprior: False
-    max_cls_conf: True
-    sigma0_scale: 1.

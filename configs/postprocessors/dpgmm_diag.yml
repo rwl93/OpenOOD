@@ -4,6 +4,7 @@ postprocessor:
   postprocessor_args:
     alpha: 1.
     covariance_type: diag
+    hierarchical: False
     estimate_hyperprior: False
     max_cls_conf: False
     sigma0_scale: 1.

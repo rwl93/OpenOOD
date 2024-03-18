@@ -9,8 +9,8 @@ from openood.postprocessors import (
     MaxLogitPostprocessor, MCDPostprocessor, MDSPostprocessor, MDSEnsemblePostprocessor,
     MOSPostprocessor, ODINPostprocessor, OpenGanPostprocessor, OpenMax, PatchcorePostprocessor,
     Rd4adPostprocessor, ReactPostprocessor, ResidualPostprocessor, ScalePostprocessor,
-    SSDPostprocessor, TemperatureScalingPostprocessor, VIMPostprocessor, RotPredPostprocessor, 
-    RankFeatPostprocessor, RMDSPostprocessor, SHEPostprocessor, CIDERPostprocessor, NPOSPostprocessor, 
+    SSDPostprocessor, TemperatureScalingPostprocessor, VIMPostprocessor, RotPredPostprocessor,
+    RankFeatPostprocessor, RMDSPostprocessor, SHEPostprocessor, CIDERPostprocessor, NPOSPostprocessor,
     GENPostprocessor, NNGuidePostprocessor, RelationPostprocessor)
 from openood.utils.config import Config, merge_configs
 
@@ -22,13 +22,11 @@ postprocessors = {
     'dpgmm_full': DPGMMPostprocessor,
     'dpgmm_diag': DPGMMPostprocessor,
     'dpgmm_spherical': DPGMMPostprocessor,
-    'dpgmm_full_esthp': DPGMMPostprocessor,
-    'dpgmm_diag_esthp': DPGMMPostprocessor,
-    'dpgmm_spherical_esthp': DPGMMPostprocessor,
-    'dpgmm_full_mcc': DPGMMPostprocessor,
-    'dpgmm_diag_mcc': DPGMMPostprocessor,
-    'dpgmm_spherical_mcc': DPGMMPostprocessor,
     'dpgmm_tied': DPGMMPostprocessor,
+    'dpgmm_full_hierarchical': DPGMMPostprocessor,
+    'dpgmm_diag_hierarchical': DPGMMPostprocessor,
+    'dpgmm_spherical_hierarchical': DPGMMPostprocessor,
+    'dpgmm_tied_hierarchical': DPGMMPostprocessor,
     'msp': BasePostprocessor,
     'ebo': EBOPostprocessor,
     'odin': ODINPostprocessor,

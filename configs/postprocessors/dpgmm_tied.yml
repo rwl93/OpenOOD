@@ -4,6 +4,7 @@ postprocessor:
   postprocessor_args:
     alpha: 1e-200
     covariance_type: tied
+    hierarchical: False
     estimate_hyperprior: False
     max_cls_conf: False
     sigma0_scale: 1.

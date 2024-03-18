@@ -1,9 +1,0 @@
-postprocessor:
-  name: dpgmm_spherical_esthp
-  APS_mode: False
-  postprocessor_args:
-    alpha: 100.
-    covariance_type: spherical
-    estimate_hyperprior: True
-    max_cls_conf: False
-    sigma0_scale: 1.

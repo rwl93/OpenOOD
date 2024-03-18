@@ -1,14 +1,14 @@
 postprocessor:
-  name: dpgmm_spherical
+  name: dpgmm_tied_hierarchical
   APS_mode: False
   postprocessor_args:
-    alpha: 1.
-    covariance_type: spherical
-    hierarchical: False
+    alpha: 1e-200
+    covariance_type: tied
+    hierarchical: True
     estimate_hyperprior: False
     max_cls_conf: False
     sigma0_scale: 1.
-    sigma0_sample_cov: True
+    sigma0_sample_cov: False
     kappa0: 1.
     use_pca: False
     pca_dim: 128
