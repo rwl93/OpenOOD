@@ -572,13 +572,13 @@ def multivariate_t_logpdf_full_torch(x, df, mean, scale_tril):
     return out.squeeze()
 
 
-class DPGMMPostprocessor(BasePostprocessor):
+class DPGMM(BasePostprocessor):
     def __init__(self, config):
         self.config = config
         self.num_classes = num_classes_dict[self.config.dataset.name]
         self.setup_flag = False
         self.args = self.config.postprocessor.postprocessor_args
-        self.covariance_type = self.args.covariance_type
+        self.covariance_type = None
         self.alpha = float(self.args.alpha)
         self.max_cls_conf = self.args.max_cls_conf
         self.sigma0_scale = self.args.sigma0_scale
@@ -602,8 +602,7 @@ class DPGMMPostprocessor(BasePostprocessor):
                 meanN  = torch.tensor(self.meanN, device=DEVICE)
                 chol = torch.tensor(self.chol, device=DEVICE)
                 return multivariate_normal_logpdf_torch(x, meanN, chol, self.covariance_type)
-            return multivariate_normal_logpdf(x, self.meanN, self.priorchol,
-                                              self.covariance_type)
+            return multivariate_normal_logpdf(x, self.meanN, self.chol, self.covariance_type)
         nu_N = self.nu0 + self.N
         dim = x.shape[1]
         df = nu_N - dim + 1
@@ -667,182 +666,6 @@ class DPGMMPostprocessor(BasePostprocessor):
             py_x = scipy.special.log_softmax(logpy_x, axis=-1)
         return py_x
 
-    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
-        if not self.setup_flag:
-            # estimate mean and variance from training set
-            print('\nEstimating cluster statistics from training set...')
-            print(f'alpha: {self.alpha}')
-            fname = 'vit-b-16-img1k-feats.pkl'
-            fname = os.path.join(os.getcwd(), fname)
-            if os.path.isfile(fname):
-                dat = torch.load(os.path.join(os.getcwd(), 'vit-b-16-img1k-feats.pkl'))
-                all_feats = dat['feats']
-                all_labels = dat['labels']
-            else:
-                all_feats = []
-                all_labels = []
-                all_preds = []
-                with torch.no_grad():
-                    for batch in tqdm(id_loader_dict['train'],
-                                      desc='Setup: ',
-                                      position=0,
-                                      leave=True):
-                        data, labels = batch['data'].cuda(), batch['label']
-                        logits, features = net(data, return_feature=True)
-                        # TODO: Only store sufficient stats to speed this up
-                        all_feats.append(features.cpu())
-                        all_labels.append(deepcopy(labels))
-                        all_preds.append(logits.argmax(1).cpu())
-
-                all_feats = torch.cat(all_feats)
-                all_labels = torch.cat(all_labels)
-                all_preds = torch.cat(all_preds)
-                print(f'Saving ViT-B/16 feats and labels to: {fname}')
-                torch.save({'feats': all_feats, 'labels': all_labels, 'preds': all_preds}, fname)
-
-            all_feats = all_feats.numpy()
-            if self.use_pca:
-                self.pca = PCA(n_components=self.pca_dim).fit(all_feats)
-                all_feats = self.pca.transform(all_feats)
-
-            dim = all_feats.shape[1]
-            self.nu0 = dim + 1
-            # self.mu0 = np.zeros(all_feats.shape[1])
-            self.mu0 = all_feats.mean(0)
-            if self.covariance_type in ['full', 'tied'] and not self.hierarchical:
-                if self.sigma0_sample_cov:
-                    # compute class-conditional statistics
-                    centered_data = all_feats - self.mu0
-                    empcov = sklearn.covariance.EmpiricalCovariance(
-                        assume_centered=False)
-                    empcov.fit(centered_data)
-                    # inverse of covariance
-                    self.Sigma0 = empcov.covariance_# precision_
-                else:
-                    self.Sigma0 = np.eye(dim) * self.sigma0_scale
-            elif self.covariance_type in ['diag', 'spherical']:
-                # unitS0: self.Sigma0 = np.ones((dim,))
-                if self.sigma0_sample_cov:
-                    # compute class-conditional statistics
-                    centered_data = all_feats - self.mu0
-                    empcov = sklearn.covariance.EmpiricalCovariance(
-                        assume_centered=False)
-                    empcov.fit(centered_data)
-                    # inverse of covariance
-                    self.Sigma0 = np.diag(empcov.covariance_) # precision_
-                    if self.covariance_type == 'spherical':
-                        self.Sigma0 = self.Sigma0.mean() * np.ones((dim,))
-                else:
-                    self.Sigma0 = np.ones((dim,)) * self.sigma0_scale
-
-            # compute class-conditional statistics
-            self.meanN = []
-            self.chol = []
-            self.N = []
-            all_SigmaN = []
-            sample_means = []
-            # Collect all class sufficient stats
-            for c in range(self.num_classes):
-                class_samples = all_feats[all_labels.eq(c)]
-                self.N.append(class_samples.shape[0])
-                kappaN = self.kappa0 + self.N[-1]
-                mk = class_samples.sum(0)
-                sample_mean = class_samples.mean(0)
-                sample_means.append(sample_mean)
-                mN = (1. / kappaN) * (self.kappa0 * self.mu0 + mk)
-                self.meanN.append(mN)
-                if self.covariance_type == 'full':
-                    eps = 1e-5 * np.eye(dim)
-                    sumxx = class_samples.T.dot(class_samples)
-                    # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
-                    # because sqrt(factor) * chol(Sigma) = chol(factor * Sigma)
-                    mu0outer = np.outer(self.mu0, self.mu0) + eps
-                    mNouter = np.outer(mN, mN)
-                    SigmaN = self.Sigma0 + self.kappa0 * mu0outer
-                    SigmaN += sumxx
-                    SigmaN -= kappaN * mNouter
-                    SigmaN += 4*eps
-                    if not ispsd(SigmaN):
-                        import pdb; pdb.set_trace()
-                    all_SigmaN.append(SigmaN)
-                elif self.covariance_type == 'tied':
-                    # Store stats
-                    sumxx = class_samples.T.dot(class_samples)
-                    # FIXME(rwl93): This seems like a weird setting for muk
-                    SigmaN = sumxx - np.outer(mk, sample_mean) - np.outer(sample_mean, mk)
-                    temp = self.N[c] * (
-                        np.outer(sample_mean, sample_mean) +
-                        np.eye(dim) * 1e-5 # Avoid precision errors
-                    )
-                    SigmaN = SigmaN + temp
-                    all_SigmaN.append(SigmaN)
-                elif self.covariance_type in ['diag', 'spherical']:
-                    sumxx = (class_samples ** 2).sum(0)
-                    if self.covariance_type == 'spherical':
-                        sumxx = sumxx.mean()
-                    SigmaN = self.Sigma0 + self.kappa0 * (self.mu0 ** 2)
-                    SigmaN += sumxx
-                    SigmaN -= kappaN * (mN ** 2)
-                    if self.covariance_type == 'spherical':
-                        SigmaN = SigmaN.mean(-1)
-                    all_SigmaN.append(SigmaN)
-                else:
-                    raise NotImplementedError
-                if self.covariance_type != 'tied':
-                    temp = compute_cov_cholesky(SigmaN, self.covariance_type) # pyright: ignore
-                    self.chol.append(temp)
-            # Compute tied chol mean N etc
-            self.N = np.array(self.N) # shape[#classes]
-            if self.covariance_type == 'tied':
-                # Sigma = (1/nu_n - dim - 1) * (Psi0 + sum_K (
-                    # sumxx_k - sumx_k @ mu_k - mu_k @ sumx_k + mu_k @ mu_k))
-                factor = 1 / (self.nu0 + self.N.sum() - dim - 1)
-                Psi0 = np.copy(self.Sigma0) # FIXME: What is a good setting for this?
-                # Class-wise portion of Sigma calculated above
-                # Sigma = list(Sigma_portion_k of shape D,D)
-                Sigma = np.stack(all_SigmaN, 0).sum(0) # (K, D, D) -> (D,D)
-                Sigma += Psi0
-                Sigma_mean = Sigma * factor
-                if self.hierarchical:
-                    epsilon = 0.001
-                    kappa = 0.001
-                    sigmasq = 0.001
-                    # Calculate Sigma0 given samples
-                    nu_tick = epsilon + self.num_classes
-                    kappa_tick = kappa + self.num_classes
-                    mu_tick = (1 / kappa_tick) * np.stack(sample_means).sum(0)
-                    muk_outers = np.stack([np.outer(s, s) for s in sample_means])
-                    Psi_tick = sigmasq * np.eye(dim) + muk_outers.sum(0)
-                    Psi_tick = Psi_tick - kappa_tick * np.outer(mu_tick, mu_tick)
-                    # FIXME: This is problematic because nu_tick is not > dim+1
-                    # Sigma0_mean = Psi_tick / (nu_tick - dim - 1)
-                    Sigma0_mean = Psi_tick / (nu_tick - 1)
-                else:
-                    Sigma0_mean = self.Sigma0
-                self.Sigma0 = Sigma0_mean + Sigma_mean
-                print("Sigma0 for debugging")
-                print(self.Sigma0)
-                Sigma0_inv = scipy.linalg.inv(Sigma0_mean)
-                Sigma_inv = scipy.linalg.inv(Sigma_mean)
-                self.meanN = []
-                self.chol = []
-                for k in range(self.num_classes):
-                    Sk = scipy.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
-                    muk = Sigma0_inv @ self.mu0 + self.N[k] * Sigma_inv @ sample_means[k]
-                    self.meanN.append(Sk @ muk)
-                    SigmaN = Sk + Sigma_mean
-                    self.chol.append(compute_cov_cholesky(SigmaN, self.covariance_type))
-                print("final SigmaN for debugging")
-                print(SigmaN)
-            self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
-            self.chol = np.stack(self.chol, 0)  # shape [#classes, feature dim, feature dim]
-
-            # Sigma0 cholesky
-            self.priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
-            self.setup_flag = True
-        else:
-            pass
-
     @torch.no_grad()
     def postprocess(self, net: nn.Module, data: Any):
         _, features = net(data, return_feature=True)
@@ -857,3 +680,379 @@ class DPGMMPostprocessor(BasePostprocessor):
         else:
             conf = - py_x[:, -1]
         return pred, conf
+
+    def get_trainset_feats(self, net: nn.Module, loader):
+        fname = 'vit-b-16-img1k-feats.pkl'
+        fname = os.path.join(os.getcwd(), fname)
+        if os.path.isfile(fname):
+            dat = torch.load(fname)
+            all_feats = dat['feats']
+            all_labels = dat['labels']
+        else:
+            all_feats = []
+            all_labels = []
+            all_preds = []
+            with torch.no_grad():
+                for batch in tqdm(loader,
+                                  desc='Extract Train Features: ',
+                                  position=0,
+                                  leave=True):
+                    data, labels = batch['data'].cuda(), batch['label']
+                    logits, features = net(data, return_feature=True)
+                    # TODO: Only store sufficient stats to speed this up
+                    all_feats.append(features.cpu())
+                    all_labels.append(deepcopy(labels))
+                    all_preds.append(logits.argmax(1).cpu())
+
+            all_feats = torch.cat(all_feats)
+            all_labels = torch.cat(all_labels)
+            all_preds = torch.cat(all_preds)
+            print(f'Saving ViT-B/16 feats and labels to: {fname}')
+            torch.save({'feats': all_feats, 'labels': all_labels, 'preds': all_preds}, fname)
+        all_feats = all_feats.numpy()
+        if self.use_pca:
+            self.pca = PCA(n_components=self.pca_dim).fit(all_feats)
+            all_feats = self.pca.transform(all_feats)
+        self.dim = all_feats.shape[1]
+        return all_feats, all_labels
+
+    def set_priors(self, all_feats):
+        # Setup priors
+        self.nu0 = self.dim + 1
+        self.mu0 = all_feats.mean(0)
+        if self.covariance_type in ['full', 'tied']:
+            if self.sigma0_sample_cov:
+                # compute class-conditional statistics
+                centered_data = all_feats - self.mu0
+                empcov = sklearn.covariance.EmpiricalCovariance(
+                    assume_centered=False)
+                empcov.fit(centered_data)
+                self.Sigma0 = empcov.covariance_
+            else:
+                self.Sigma0 = np.eye(self.dim) * self.sigma0_scale
+        elif self.covariance_type in ['diag', 'spherical']:
+            if self.sigma0_sample_cov:
+                # compute class-conditional statistics
+                centered_data = all_feats - self.mu0
+                empcov = sklearn.covariance.EmpiricalCovariance(
+                    assume_centered=False)
+                empcov.fit(centered_data)
+                # inverse of covariance
+                self.Sigma0 = np.diag(empcov.covariance_) # precision_
+                if self.covariance_type == 'spherical':
+                    self.Sigma0 = self.Sigma0.mean() * np.ones((self.dim,))
+            else:
+                self.Sigma0 = np.ones((self.dim,)) * self.sigma0_scale
+
+    def get_trainset_stats(self, all_feats, all_labels):
+        # compute class-conditional statistics
+        Sk = []
+        mk = []
+        sample_means = []
+        N = []
+        # Collect all class sufficient stats
+        for c in range(self.num_classes):
+            class_samples = all_feats[all_labels.eq(c)]
+            N.append(class_samples.shape[0])
+            mk.append(class_samples.sum(0))
+            sample_means.append(class_samples.mean(0))
+            if self.covariance_type in ['full', 'tied']:
+                Sk.append(class_samples.T.dot(class_samples))
+            elif self.covariance_type == 'diag':
+                Sk.append((class_samples ** 2).sum(0))
+            elif self.covariance_type == 'spherical':
+                Sk.append((class_samples ** 2).sum(0).mean())
+        self.N = np.array(N)
+        return mk, Sk, sample_means
+
+    def initial_setup(self, net: nn.Module, loader):
+        all_feats, all_labels = self.get_trainset_feats(net, loader)
+        self.set_priors(all_feats)
+        mk, Sk, sample_means = self.get_trainset_stats(all_feats, all_labels)
+        return mk, Sk, sample_means
+
+    @property
+    def priorchol(self):
+        if not hasattr(self, '_priorchol'):
+            raise AttributeError("Must run setup before accessing priorchol")
+        return self._priorchol
+
+    @property
+    def chol(self):
+        if not hasattr(self, '_chol'):
+            raise AttributeError("Must run setup before accessing chol")
+        return self._chol
+
+
+class TiedDPGMMPostprocessor(DPGMM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.covariance_type = 'tied'
+
+    def setup(self, mk, Sk):
+        if not self.setup_flag:
+            # estimate mean and variance from training set
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
+            sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+
+            # Calculate ssd
+            ssd = []
+            for c in range(self.num_classes):
+                Sk = sumxx[c]
+                mk = sumx[c]
+                muk = sample_means[c]
+                mkmuk = np.outer(mk, muk)
+                temp = self.N[c] * (np.outer(muk, muk) + np.eye(dim) * 1e-5) # Avoid precision errors
+                ssd.append(Sk - (mkmuk + mkmuk.T) + temp)
+            ssd = np.stack(ssd, 0)
+
+            # Calculate Sigma
+            factor = 1 / (self.nu0 + self.N.sum() - dim - 1)
+            Psi0 = np.copy(self.Sigma0) # FIXME: What is a good setting for this?
+            Sigma = ssd.sum(0) + Psi0 # (K, D, D) -> (D,D)
+            Sigma_mean = Sigma * factor
+
+            # Calculate Sk, meanN, SigmaN
+            Sigma0_inv = scipy.linalg.inv(self.Sigma0)
+            Sigma_inv = scipy.linalg.inv(Sigma_mean)
+
+            self._chol = []
+            self.meanN = []
+            for k in range(self.num_classes):
+                Sk = scipy.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
+                muk = Sigma0_inv @ self.mu0 + self.N[k] * Sigma_inv @ sample_means[k]
+                self.meanN.append(Sk @ muk)
+                SigmaN = Sk + Sigma_mean
+                self._chol.append(
+                    compute_cov_cholesky(SigmaN, self.covariance_type))
+            # shape [#classes, feature dim, feature dim]
+            self._chol = np.stack(self._chol, 0)
+            self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
+
+            # Set self.Sigma0 for calculating logpriorpred
+            Sigma0 = self.Sigma0 + Sigma_mean
+            self._priorchol = compute_cov_cholesky(Sigma0, self.covariance_type)
+            print("Sigma0 for debugging")
+            print(Sigma0)
+            print("Final SigmaN for debugging")
+            print(SigmaN)
+            self.setup_flag = True
+        else:
+            pass
+
+
+class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.covariance_type = 'tied'
+
+    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
+        if not self.setup_flag:
+            # estimate mean and variance from training set
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
+            sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+
+            # Calculate ssd
+            ssd = []
+            for c in range(self.num_classes):
+                Sk = sumxx[c]
+                mk = sumx[c]
+                muk = sample_means[c]
+                mkmuk = np.outer(mk, muk)
+                temp = self.N[c] * (np.outer(muk, muk) + np.eye(dim) * 1e-5) # Avoid precision errors
+                ssd.append(Sk - (mkmuk + mkmuk.T) + temp)
+            ssd = np.stack(ssd, 0)
+
+            # Calculate Sigma
+            factor = 1 / (self.nu0 + self.N.sum() - dim - 1)
+            Psi0 = np.copy(self.Sigma0) # FIXME: What is a good setting for this?
+            Sigma = ssd.sum(0) + Psi0 # (K, D, D) -> (D,D)
+            Sigma_mean = Sigma * factor
+
+            # Calculate Sigma0 and mu0
+            # NOTE: Set this to dim + epsilon to ensure nu > dim - 1
+            epsilon = self.dim + 0.001
+            kappa = 0.001
+            sigmasq = 0.001
+            nu_tick = epsilon + self.num_classes
+            kappa_tick = kappa + self.num_classes
+            mu_tick = (1 / kappa_tick) * np.stack(sample_means).sum(0)
+            self.mu0 = mu_tick
+            muk_outers = np.stack([np.outer(s, s) for s in sample_means])
+            Psi_tick = sigmasq * np.eye(dim) + muk_outers.sum(0)
+            Psi_tick = Psi_tick - kappa_tick * np.outer(mu_tick, mu_tick)
+            Sigma0_mean = Psi_tick / (nu_tick - dim - 1)
+
+            # Calculate Sk, meanN, SigmaN
+            Sigma0_inv = scipy.linalg.inv(Sigma0_mean)
+            Sigma_inv = scipy.linalg.inv(Sigma_mean)
+
+            self._chol = []
+            self.meanN = []
+            for k in range(self.num_classes):
+                Sk = scipy.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
+                muk = Sigma0_inv @ self.mu0 + self.N[k] * Sigma_inv @ sample_means[k]
+                self.meanN.append(Sk @ muk)
+                SigmaN = Sk + Sigma_mean
+                self._chol.append(compute_cov_cholesky(SigmaN, self.covariance_type))
+            # shape [#classes, feature dim, feature dim]
+            self._chol = np.stack(self._chol, 0)
+            self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
+
+            # Set _priorchol for calculating logpriorpred
+            Sigma0 = Sigma0_mean + Sigma_mean
+            print("Sigma0 for debugging")
+            print(Sigma0)
+            self._priorchol = compute_cov_cholesky(Sigma0, self.covariance_type)
+
+            print("Final SigmaN for debugging")
+            print(SigmaN)
+            self.setup_flag = True
+        else:
+            pass
+
+
+class FullDPGMMPostprocessor(DPGMM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.covariance_type = 'full'
+
+    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
+        if not self.setup_flag:
+            # estimate mean and variance from training set
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
+            sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+
+            # Calculate class means
+            kappaN = self.kappa0 + self.N
+            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
+
+            # Calculate class Sigmas
+            eps = 1e-5 * np.eye(dim)
+            self._chol = []
+            for c in range(self.num_classes):
+                # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
+                # because sqrt(factor) * chol(Sigma) = chol(factor * Sigma)
+                mu0outer = np.outer(self.mu0, self.mu0) + eps
+                mNouter = np.outer(self.meanN[c], self.meanN[c])
+                SigmaN = self.Sigma0 + self.kappa0 * mu0outer
+                SigmaN += sumxx[c]
+                SigmaN -= kappaN[c] * mNouter
+                SigmaN += 4*eps
+                if not ispsd(SigmaN):
+                    import pdb; pdb.set_trace()
+                chol = compute_cov_cholesky(SigmaN, self.covariance_type)
+                self._chol.append(chol)
+            # shape [#classes, feature dim, feature dim]
+            self._chol = np.stack(self._chol, 0)
+            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+            self.setup_flag = True
+        else:
+            pass
+
+
+class HierarchicalDPGMMPostprocessor(DPGMM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.covariance_type = 'full'
+
+    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
+        if not self.setup_flag:
+            # estimate mean and variance from training set
+            raise NotImplementedError
+            # print('\nEstimating cluster statistics from training set...')
+            # print(f'alpha: {self.alpha}')
+            # sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+
+            # # Calculate class means
+            # kappaN = self.kappa0 + self.N
+            # self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
+
+            # # Calculate class Sigmas
+            # eps = 1e-5 * np.eye(dim)
+            # self._chol = []
+            # for c in range(self.num_classes):
+            #     # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
+            #     # because sqrt(factor) * chol(Sigma) = chol(factor * Sigma)
+            #     mu0outer = np.outer(self.mu0, self.mu0) + eps
+            #     mNouter = np.outer(self.meanN[c], self.meanN[c])
+            #     SigmaN = self.Sigma0 + self.kappa0 * mu0outer
+            #     SigmaN += sumxx[c]
+            #     SigmaN -= kappaN[c] * mNouter
+            #     SigmaN += 4*eps
+            #     if not ispsd(SigmaN):
+            #         import pdb; pdb.set_trace()
+            #     chol = compute_cov_cholesky(SigmaN, self.covariance_type)
+            #     self._chol.append(chol)
+            # # shape [#classes, feature dim, feature dim]
+            # self._chol = np.stack(self._chol, 0)
+            # self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+            # self.setup_flag = True
+        else:
+            pass
+
+
+class DiagDPGMMPostprocessor(DPGMM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.covariance_type = 'diag'
+
+    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
+        if not self.setup_flag:
+            # estimate mean and variance from training set
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
+            sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+
+            # Calculate class means
+            kappaN = self.kappa0 + self.N
+            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
+
+            # Set class Sigmas
+            self._chol = []
+            for c in range(self.num_classes):
+                SigmaN = self.Sigma0 + self.kappa0 * (self.mu0 ** 2)
+                SigmaN += sumxx[c]
+                SigmaN -= kappaN[c] * (self.meanN[c] ** 2)
+                self._chol.append(compute_cov_cholesky(
+                    SigmaN, self.covariance_type))
+            self._chol = np.stack(self._chol, 0)
+            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+            self.setup_flag = True
+        else:
+            pass
+
+
+class SphericalDPGMMPostprocessor(DPGMM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.covariance_type = 'spherical'
+
+    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
+        if not self.setup_flag:
+            # estimate mean and variance from training set
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
+            sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+
+            # Calculate class means
+            kappaN = self.kappa0 + self.N
+            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
+
+            # Set class Sigmas
+            self._chol = []
+            for c in range(self.num_classes):
+                SigmaN = self.Sigma0 + self.kappa0 * (self.mu0 ** 2)
+                SigmaN += sumxx[c]
+                SigmaN -= kappaN[c] * (self.meanN[c] ** 2)
+                SigmaN = SigmaN.mean(-1)
+                self._chol.append(compute_cov_cholesky(
+                    SigmaN, self.covariance_type))
+            self._chol = np.stack(self._chol, 0)
+            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+            self.setup_flag = True
+        else:
+            pass
