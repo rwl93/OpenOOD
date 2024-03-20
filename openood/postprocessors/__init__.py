@@ -4,7 +4,12 @@ from .cider_postprocessor import CIDERPostprocessor
 from .conf_branch_postprocessor import ConfBranchPostprocessor
 from .cutpaste_postprocessor import CutPastePostprocessor
 from .dice_postprocessor import DICEPostprocessor
-from .dpgmm_postprocessor import DPGMMPostprocessor
+from .dpgmm_postprocessor import TiedDPGMMPostprocessor
+from .dpgmm_postprocessor import FullyBayesianTiedDPGMMPostprocessor
+from .dpgmm_postprocessor import FullDPGMMPostprocessor
+from .dpgmm_postprocessor import DiagDPGMMPostprocessor
+from .dpgmm_postprocessor import SphericalDPGMMPostprocessor
+from .dpgmm_postprocessor import HierarchicalDPGMMPostprocessor
 from .draem_postprocessor import DRAEMPostprocessor
 from .dropout_postprocessor import DropoutPostProcessor
 from .dsvdd_postprocessor import DSVDDPostprocessor

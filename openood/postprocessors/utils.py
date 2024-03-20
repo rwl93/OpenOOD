@@ -6,7 +6,12 @@ from .cider_postprocessor import CIDERPostprocessor
 from .conf_branch_postprocessor import ConfBranchPostprocessor
 from .cutpaste_postprocessor import CutPastePostprocessor
 from .dice_postprocessor import DICEPostprocessor
-from .dpgmm_postprocessor import DPGMMPostprocessor
+from .dpgmm_postprocessor import TiedDPGMMPostprocessor
+from .dpgmm_postprocessor import FullyBayesianTiedDPGMMPostprocessor
+from .dpgmm_postprocessor import FullDPGMMPostprocessor
+from .dpgmm_postprocessor import DiagDPGMMPostprocessor
+from .dpgmm_postprocessor import SphericalDPGMMPostprocessor
+from .dpgmm_postprocessor import HierarchicalDPGMMPostprocessor
 from .draem_postprocessor import DRAEMPostprocessor
 from .dropout_postprocessor import DropoutPostProcessor
 from .dsvdd_postprocessor import DSVDDPostprocessor
@@ -70,15 +75,13 @@ def get_postprocessor(config: Config):
         'temperature_scaling': TemperatureScalingPostprocessor,
         'ensemble': EnsemblePostprocessor,
         'dropout': DropoutPostProcessor,
-        'dpgmm': DPGMMPostprocessor,
-        'dpgmm_full': DPGMMPostprocessor,
-        'dpgmm_diag': DPGMMPostprocessor,
-        'dpgmm_spherical': DPGMMPostprocessor,
-        'dpgmm_tied': DPGMMPostprocessor,
-        'dpgmm_full_hierarchical': DPGMMPostprocessor,
-        'dpgmm_diag_hierarchical': DPGMMPostprocessor,
-        'dpgmm_spherical_hierarchical': DPGMMPostprocessor,
-        'dpgmm_tied_hierarchical': DPGMMPostprocessor,
+        'dpgmm': FullDPGMMPostprocessor,
+        'dpgmm_full': FullDPGMMPostprocessor,
+        'dpgmm_diag': DiagDPGMMPostprocessor,
+        'dpgmm_spherical': SphericalDPGMMPostprocessor,
+        'dpgmm_tied': TiedDPGMMPostprocessor,
+        'dpgmm_tied_hierarchical': FullyBayesianTiedDPGMMPostprocessor,
+        'dpgmm_hierarchical': HierarchicalDPGMMPostprocessor,
         'draem': DRAEMPostprocessor,
         'dsvdd': DSVDDPostprocessor,
         'mos': MOSPostprocessor,
