@@ -3,12 +3,9 @@ postprocessor:
   APS_mode: False
   postprocessor_args:
     alpha: 1.
-    covariance_type: diag
-    hierarchical: False
-    estimate_hyperprior: False
     max_cls_conf: False
     sigma0_scale: 1.
     sigma0_sample_cov: True
     kappa0: 1
-    use_pca: True
+    use_pca: False
     pca_dim: 128

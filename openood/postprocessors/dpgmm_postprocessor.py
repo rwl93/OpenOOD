@@ -586,7 +586,6 @@ class DPGMM(BasePostprocessor):
         self.kappa0 = self.args.kappa0
         self.use_pca = self.args.use_pca
         self.pca_dim = self.args.pca_dim
-        self.hierarchical = self.args.hierarchical
         self.args_dict = self.config.postprocessor.postprocessor_sweep
 
     def set_hyperparam(self, hyperparam: list):

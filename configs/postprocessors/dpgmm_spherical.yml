@@ -3,9 +3,6 @@ postprocessor:
   APS_mode: False
   postprocessor_args:
     alpha: 1.
-    covariance_type: spherical
-    hierarchical: False
-    estimate_hyperprior: False
     max_cls_conf: False
     sigma0_scale: 1.
     sigma0_sample_cov: True
