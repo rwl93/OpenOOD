@@ -788,7 +788,7 @@ class TiedDPGMMPostprocessor(DPGMM):
         super().__init__(config)
         self.covariance_type = 'tied'
 
-    def setup(self, mk, Sk):
+    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
             # estimate mean and variance from training set
             print('\nEstimating cluster statistics from training set...')
@@ -802,12 +802,12 @@ class TiedDPGMMPostprocessor(DPGMM):
                 mk = sumx[c]
                 muk = sample_means[c]
                 mkmuk = np.outer(mk, muk)
-                temp = self.N[c] * (np.outer(muk, muk) + np.eye(dim) * 1e-5) # Avoid precision errors
+                temp = self.N[c] * (np.outer(muk, muk) + np.eye(self.dim) * 1e-5) # Avoid precision errors
                 ssd.append(Sk - (mkmuk + mkmuk.T) + temp)
             ssd = np.stack(ssd, 0)
 
             # Calculate Sigma
-            factor = 1 / (self.nu0 + self.N.sum() - dim - 1)
+            factor = 1 / (self.nu0 + self.N.sum() - self.dim - 1)
             Psi0 = np.copy(self.Sigma0) # FIXME: What is a good setting for this?
             Sigma = ssd.sum(0) + Psi0 # (K, D, D) -> (D,D)
             Sigma_mean = Sigma * factor
@@ -860,12 +860,12 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
                 mk = sumx[c]
                 muk = sample_means[c]
                 mkmuk = np.outer(mk, muk)
-                temp = self.N[c] * (np.outer(muk, muk) + np.eye(dim) * 1e-5) # Avoid precision errors
+                temp = self.N[c] * (np.outer(muk, muk) + np.eye(self.dim) * 1e-5) # Avoid precision errors
                 ssd.append(Sk - (mkmuk + mkmuk.T) + temp)
             ssd = np.stack(ssd, 0)
 
             # Calculate Sigma
-            factor = 1 / (self.nu0 + self.N.sum() - dim - 1)
+            factor = 1 / (self.nu0 + self.N.sum() - self.dim - 1)
             Psi0 = np.copy(self.Sigma0) # FIXME: What is a good setting for this?
             Sigma = ssd.sum(0) + Psi0 # (K, D, D) -> (D,D)
             Sigma_mean = Sigma * factor
@@ -880,9 +880,9 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
             mu_tick = (1 / kappa_tick) * np.stack(sample_means).sum(0)
             self.mu0 = mu_tick
             muk_outers = np.stack([np.outer(s, s) for s in sample_means])
-            Psi_tick = sigmasq * np.eye(dim) + muk_outers.sum(0)
+            Psi_tick = sigmasq * np.eye(self.dim) + muk_outers.sum(0)
             Psi_tick = Psi_tick - kappa_tick * np.outer(mu_tick, mu_tick)
-            Sigma0_mean = Psi_tick / (nu_tick - dim - 1)
+            Sigma0_mean = Psi_tick / (nu_tick - self.dim - 1)
 
             # Calculate Sk, meanN, SigmaN
             Sigma0_inv = scipy.linalg.inv(Sigma0_mean)
