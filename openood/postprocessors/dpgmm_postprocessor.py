@@ -572,6 +572,19 @@ def multivariate_t_logpdf_full_torch(x, df, mean, scale_tril):
     return out.squeeze()
 
 
+def calc_ssd(N, sumx, sumxx, mu, dim):
+    """Calculate sum of squared deviations"""
+    ssd = []
+    for c in range(N.shape[0]):
+        Sk = sumxx[c]
+        mk = sumx[c]
+        muk = mu[c]
+        mkmuk = np.outer(mk, muk)
+        temp = N[c] * (np.outer(muk, muk) + np.eye(dim) * 1e-5) # Avoid precision errors
+        ssd.append(Sk - (mkmuk + mkmuk.T) + temp)
+    return np.stack(ssd, 0)
+
+
 class DPGMM(BasePostprocessor):
     def __init__(self, config):
         self.config = config
@@ -587,6 +600,7 @@ class DPGMM(BasePostprocessor):
         self.use_pca = self.args.use_pca
         self.pca_dim = self.args.pca_dim
         self.args_dict = self.config.postprocessor.postprocessor_sweep
+        self._params = {"_chol": None, "_priorchol": None, "mu0": None, "meanN": None}
 
     def set_hyperparam(self, hyperparam: list):
         self.sigma0_scale = hyperparam[1]
@@ -666,11 +680,14 @@ class DPGMM(BasePostprocessor):
         return py_x
 
     @torch.no_grad()
-    def postprocess(self, net: nn.Module, data: Any):
-        _, features = net(data, return_feature=True)
-        if self.use_pca:
-            features = self.pca.transform(features.cpu().numpy())
-            features = torch.tensor(features).to(DEVICE)
+    def postprocess(self, net: nn.Module, data: Any, from_feats: bool = False):
+        if from_feats:
+            features = data
+        else:
+            _, features = net(data, return_feature=True)
+            if self.use_pca:
+                features = self.pca.transform(features.cpu().numpy())
+                features = torch.tensor(features).to(DEVICE)
         py_x = self.py_x(features, use_torch=True)
         id_probs = py_x[:,:-1]
         pred = id_probs.argmax(1)
@@ -679,6 +696,14 @@ class DPGMM(BasePostprocessor):
         else:
             conf = - py_x[:, -1]
         return pred, conf
+
+    @torch.no_grad()
+    def extract_features_batch(self, net, data):
+        _, features = net(data, return_feature=True)
+        if self.use_pca:
+            features = self.pca.transform(features.cpu().numpy())
+            features = torch.tensor(features).to(DEVICE)
+        return features
 
     def get_trainset_feats(self, net: nn.Module, loader):
         fname = 'vit-b-16-img1k-feats.pkl'
@@ -719,6 +744,9 @@ class DPGMM(BasePostprocessor):
         # Setup priors
         self.nu0 = self.dim + 1
         self.mu0 = all_feats.mean(0)
+        self.epsilon = self.dim + 0.001
+        self.kappa = 0.001
+        self.sigmasq = 0.001
         if self.covariance_type in ['full', 'tied']:
             if self.sigma0_sample_cov:
                 # compute class-conditional statistics
@@ -742,6 +770,7 @@ class DPGMM(BasePostprocessor):
                     self.Sigma0 = self.Sigma0.mean() * np.ones((self.dim,))
             else:
                 self.Sigma0 = np.ones((self.dim,)) * self.sigma0_scale
+        self.Psi0 = np.copy(self.Sigma0)
 
     def get_trainset_stats(self, all_feats, all_labels):
         # compute class-conditional statistics
@@ -845,6 +874,7 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
     def __init__(self, config):
         super().__init__(config)
         self.covariance_type = 'tied'
+        self._params.update({"Sigma": None, "mu0": None, "Sigma0": None})
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
@@ -852,65 +882,120 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
             print('\nEstimating cluster statistics from training set...')
             print(f'alpha: {self.alpha}')
             sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+            self.sumx = sumx
+            self.sumxx = sumxx
+            self.sample_means = sample_means
 
-            # Calculate ssd
-            ssd = []
-            for c in range(self.num_classes):
-                Sk = sumxx[c]
-                mk = sumx[c]
-                muk = sample_means[c]
-                mkmuk = np.outer(mk, muk)
-                temp = self.N[c] * (np.outer(muk, muk) + np.eye(dim) * 1e-5) # Avoid precision errors
-                ssd.append(Sk - (mkmuk + mkmuk.T) + temp)
-            ssd = np.stack(ssd, 0)
+            ssd = calc_ssd(self.N, sumx, sumxx, sample_means, self.dim)
 
             # Calculate Sigma
             factor = 1 / (self.nu0 + self.N.sum() - dim - 1)
-            Psi0 = np.copy(self.Sigma0) # FIXME: What is a good setting for this?
-            Sigma = ssd.sum(0) + Psi0 # (K, D, D) -> (D,D)
-            Sigma_mean = Sigma * factor
+            Sigma = ssd.sum(0) + self.Psi0 # (K, D, D) -> (D,D)
+            self.Sigma = Sigma * factor
 
             # Calculate Sigma0 and mu0
             # NOTE: Set this to dim + epsilon to ensure nu > dim - 1
-            epsilon = self.dim + 0.001
-            kappa = 0.001
-            sigmasq = 0.001
-            nu_tick = epsilon + self.num_classes
-            kappa_tick = kappa + self.num_classes
+            nu_tick = self.epsilon + self.num_classes
+            kappa_tick = self.kappa + self.num_classes
             mu_tick = (1 / kappa_tick) * np.stack(sample_means).sum(0)
             self.mu0 = mu_tick
             muk_outers = np.stack([np.outer(s, s) for s in sample_means])
-            Psi_tick = sigmasq * np.eye(dim) + muk_outers.sum(0)
+            Psi_tick = self.sigmasq * np.eye(dim) + muk_outers.sum(0)
             Psi_tick = Psi_tick - kappa_tick * np.outer(mu_tick, mu_tick)
-            Sigma0_mean = Psi_tick / (nu_tick - dim - 1)
+            self.Sigma0 = Psi_tick / (nu_tick - dim - 1)
 
             # Calculate Sk, meanN, SigmaN
-            Sigma0_inv = scipy.linalg.inv(Sigma0_mean)
-            Sigma_inv = scipy.linalg.inv(Sigma_mean)
+            self.Sigma0_inv = scipy.linalg.inv(self.Sigma0)
+            self.Sigma_inv = scipy.linalg.inv(self.Sigma)
 
             self._chol = []
             self.meanN = []
             for k in range(self.num_classes):
-                Sk = scipy.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
-                muk = Sigma0_inv @ self.mu0 + self.N[k] * Sigma_inv @ sample_means[k]
+                Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
+                muk = self.Sigma0_inv @ self.mu0 + self.N[k] * self.Sigma_inv @ sample_means[k]
                 self.meanN.append(Sk @ muk)
-                SigmaN = Sk + Sigma_mean
+                SigmaN = Sk + self.Sigma
                 self._chol.append(compute_cov_cholesky(SigmaN, self.covariance_type))
             # shape [#classes, feature dim, feature dim]
             self._chol = np.stack(self._chol, 0)
             self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
 
             # Set _priorchol for calculating logpriorpred
-            Sigma0 = Sigma0_mean + Sigma_mean
             print("Sigma0 for debugging")
-            print(Sigma0)
-            self._priorchol = compute_cov_cholesky(Sigma0, self.covariance_type)
+            print(self.Sigma0 + self.Sigma)
+            self._priorchol = compute_cov_cholesky(self.Sigma0 + self.Sigma,
+                                                   self.covariance_type)
 
             print("Final SigmaN for debugging")
             print(SigmaN)
             self.setup_flag = True
         else:
             pass
+
+    def sample_mu(self):
+        """Sample mu for each class
+
+        Sample from :math:`\mathcal{N}(\hat{\mu}_k, \hat{S}_k)`
+        where:
+        .. math::
+            \hat{S}_k &= (\Sigma_0^{-1} + N_k \Sigma^{-1})^{-1} \\
+            \hat{\mu}_k &= \hat{S}_k (\Sigma_0^{-1} \mu_0 + N_k \Sigma^{-1} \bar{x})^{-1}
+
+        Note
+        ----
+        We need to do this despite it being integrated out in the
+        posterior predictive because the other Gibbs samplers use this
+        quantity.
+        """
+        meanN = []
+        for c in range(self.num_classes):
+            Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[c] * self.Sigma_inv)
+            muk = self.Sigma0_inv @ self.mu0 + self.N[c] * self.Sigma_inv @ self.sample_means[c]
+            muk = Sk @ muk
+            mN = np.random.multivariate_normal(muk, Sk)
+            meanN.append(mN)
+        self.meanN = np.vstack(meanN)
+
+    def sample_Sigma(self):
+        """Sample Sigma
+
+        Sample from :math:`\mathrm{IW}\left(\nu_0 + N, \Psi_0 + ssd \right)`
+        where:
+        .. math::
+            ssd &= \sum_{n=1}^N (x_n - \mu_{z_n})(x_n - \mu_{z_n})^\top \\
+                &= \sum_{k=1}^K S_k - m_k \mu_k^\top - \mu_k m_k^\top + N_k \mu_k\mu_k^\top
+        """
+        nuN = self.nu0 + self.N.sum()
+        ssd = calc_ssd(self.N, self.sumx, self.sumxx, self.meanN, self.dim)
+        shape = self.Psi0 + ssd
+        self.Sigma = scipy.stats.invwishart(nuN, shape)
+        self.Sigma_inv = scipy.linalg.inv(self.Sigma)
+
+        # Update class-wise choleskys
+        chol = []
+        for k in range(self.num_classes):
+            Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
+            Sigmak = Sk + self.Sigma
+            chol.append(compute_cov_cholesky(Sigmak, self.covariance_type))
+        self._chol = np.stack(chol, 0)
+
+    def sample_hyperpriors(self):
+        nutick = self.epsilon + self.num_classes
+        kappatick = self.kappa + self.num_classes
+        mutick = self.meanN.sum(0) / kappatick
+        mukmuk = np.stack([np.outer(m, m) for m in self.meanN], 0)
+        Psitick = self.sigmasq * np.eye(self.dim) + mukmuk.sum(0) \
+            - kappatick * np.outer(mutick, mutick)
+        self.Sigma0 = scipy.stats.invwishart(nutick, Psitick).rvs()
+        self.mu0 = np.random.multivariate_normal(mutick, self.Sigma0 / kappatick)
+        self.Sigma0_inv = scipy.linalg.inv(self.Sigma0)
+        # FIXME: Check that _priorchol isnt Sigma0+Sigma
+        self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+
+    def gibbs(self):
+        self.sample_mu()
+        self.sample_hyperpriors()
+        self.sample_Sigma()
 
 
 class FullDPGMMPostprocessor(DPGMM):

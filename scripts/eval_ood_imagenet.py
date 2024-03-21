@@ -15,7 +15,7 @@ from torchvision.models import ResNet50_Weights, Swin_T_Weights, ViT_B_16_Weight
 from torchvision import transforms as trn
 from torch.hub import load_state_dict_from_url
 
-from openood.evaluation_api import Evaluator
+from openood.evaluation_api import Evaluator, GibbsEvaluator
 
 from openood.networks import ResNet50, Swin_T, ViT_B_16, RegNet_Y_16GF
 from openood.networks.conf_branch_net import ConfBranchNet
@@ -46,6 +46,9 @@ parser.add_argument('--save-score', action='store_true')
 parser.add_argument('--fsood', action='store_true')
 parser.add_argument('--batch-size', default=200, type=int)
 parser.add_argument('--noshuffle', default=False, action='store_true')
+parser.add_argument('--gibbs', default=False, action='store_true')
+parser.add_argument('--num-gibbs-samples', default=1000, type=int,
+                    help="Number of times to Gibbs sample the parameters.")
 args = parser.parse_args()
 
 if not args.tvs_pretrained:
@@ -132,7 +135,8 @@ else:
 net.cuda()
 net.eval()
 # a unified evaluator
-evaluator = Evaluator(
+evaluatorclass = GibbsEvaluator if args.gibbs else Evaluator
+evaluator = evaluatorclass(
     net,
     id_name='imagenet',  # the target ID dataset
     data_root=os.path.join(ROOT_DIR, 'data'),
@@ -143,6 +147,9 @@ evaluator = Evaluator(
     batch_size=args.batch_size,  # for certain methods the results can be slightly affected by batch size
     shuffle=(not args.noshuffle), # Don't shuffle so that I can plot histograms
     num_workers=8)
+
+if args.gibbs:
+    evaluator.num_gibbs_samples = args.num_gibbs_samples # type: ignore
 
 # load pre-computed scores if exists
 if os.path.isfile(os.path.join(root, 'scores', f'{postprocessor_name}.pkl')):

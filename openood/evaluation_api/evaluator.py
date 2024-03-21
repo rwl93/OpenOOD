@@ -440,3 +440,192 @@ class Evaluator:
                     k.append(x)
                     results.append(k)
             return results
+
+
+class GibbsEvaluator(Evaluator):
+    def __init__(
+        self,
+        net: nn.Module,
+        id_name: str,
+        data_root: str = './data',
+        config_root: str = './configs',
+        preprocessor: Callable = None,
+        postprocessor_name: str = None,
+        postprocessor: Type[BasePostprocessor] = None,
+        batch_size: int = 200,
+        shuffle: bool = False,
+        num_workers: int = 4,
+    ) -> None:
+        super().__init__(net, id_name, data_root, config_root, preprocessor,
+                         postprocessor_name, postprocessor, batch_size,
+                         shuffle, num_workers)
+        self._num_gibbs_samples = 1
+        self.postprocessor_name = postprocessor_name
+
+    @property
+    def num_gibbs_samples(self):
+        return self._num_gibbs_samples
+
+    @num_gibbs_samples.setter
+    def num_gibbs_samples(self, value):
+        self._num_gibbs_samples = value
+
+    def eval_ood(self, fsood: bool = False, progress: bool = True):
+        id_name = 'id' if not fsood else 'csid'
+        task = 'ood' if not fsood else 'fsood'
+
+        # Generate all parameter values
+        self.net.eval()
+        params = []
+        for _ in range(self.num_gibbs_samples):
+            if not hasattr(self.postprocessor, 'gibbs'):
+                raise AttributeError(
+                    f'Postprocessor {self.postprocessor_name} does not support Gibbs sampling')
+            self.postprocessor.gibbs() # type: ignore
+            params.append(self.postprocessor.params)
+
+        # Store features from feature extractor for each task if the
+        # postprocessor allows for it
+        if self.metrics[task] is None:
+            # id score
+            if self.scores['id']['test'] is None:
+                print(f'Performing inference on {self.id_name} test set...',
+                      flush=True)
+                # Gather features
+                id_feats, id_gt = self.postprocessor.extract_features(
+                    self.net, self.dataloader_dict['id']['test'], progress)
+                self.scores['id']['test'] = []
+                for p in params:
+                    self.postprocessor.params = p
+                    id_pred, id_conf = self.postprocessor.gibbs_inference(
+                        id_feats, progress)
+                    # Store scores for each set of params
+                    self.scores['id']['test'].append([id_pred, id_conf, id_gt])
+                # Don't store data heavy features
+                del id_feats
+            else:
+                # id_pred, id_conf, id_gt = self.scores['id']['test']
+                raise NotImplementedError("Not yet supporting loading scores for gibbs sampling")
+
+            if fsood:
+                # csid_pred, csid_conf, csid_gt = [], [], []
+                # for i, dataset_name in enumerate(self.scores['csid'].keys()):
+                #     if self.scores['csid'][dataset_name] is None:
+                #         print(
+                #             f'Performing inference on {self.id_name} '
+                #             f'(cs) test set [{i+1}]: {dataset_name}...',
+                #             flush=True)
+                #         temp_pred, temp_conf, temp_gt = \
+                #             self.postprocessor.inference(
+                #                 self.net,
+                #                 self.dataloader_dict['csid'][dataset_name],
+                #                 progress)
+                #         self.scores['csid'][dataset_name] = [
+                #             temp_pred, temp_conf, temp_gt
+                #         ]
+
+                #     csid_pred.append(self.scores['csid'][dataset_name][0])
+                #     csid_conf.append(self.scores['csid'][dataset_name][1])
+                #     csid_gt.append(self.scores['csid'][dataset_name][2])
+
+                # csid_pred = np.concatenate(csid_pred)
+                # csid_conf = np.concatenate(csid_conf)
+                # csid_gt = np.concatenate(csid_gt)
+
+                # id_pred = np.concatenate((id_pred, csid_pred))
+                # id_conf = np.concatenate((id_conf, csid_conf))
+                # id_gt = np.concatenate((id_gt, csid_gt))
+                raise NotImplementedError("Not yet supporting FSOOD for gibbs sampling")
+
+            # load nearood data and compute ood metrics
+            near_metrics = self._eval_ood(params,
+                                          ood_split='near',
+                                          progress=progress)
+            # load farood data and compute ood metrics
+            far_metrics = self._eval_ood(params,
+                                         ood_split='far',
+                                         progress=progress)
+
+            if self.metrics[f'{id_name}_acc'] is None:
+                self.metrics[f'{id_name}_acc'] = near_metrics[0,-1]
+
+            self.metrics[task] = pd.DataFrame(
+                np.concatenate([near_metrics, far_metrics], axis=0),
+                index=list(self.dataloader_dict['ood']['near'].keys()) +
+                ['nearood'] + list(self.dataloader_dict['ood']['far'].keys()) +
+                ['farood'],
+                columns=['FPR@95', 'AUROC', 'AUPR_IN', 'AUPR_OUT', 'ACC'],
+            )
+        else:
+            print('Evaluation has already been done!')
+
+        with pd.option_context(
+                'display.max_rows', None, 'display.max_columns', None,
+                'display.float_format',
+                '{:,.2f}'.format):  # more options can be specified also
+            print(self.metrics[task])
+
+        return self.metrics[task]
+
+    def _eval_ood(self,
+                  id_list: List[np.ndarray],
+                  ood_split: str = 'near',
+                  progress: bool = True):
+        """NOTE: Changing id_list to actually be gibbs parameters"""
+        print(f'Processing {ood_split} ood...', flush=True)
+        params = id_list
+        metrics_list = []
+        for dataset_name, ood_dl in self.dataloader_dict['ood'][
+                ood_split].items():
+            if self.scores['ood'][ood_split][dataset_name] is None:
+                print(f'Performing inference on {dataset_name} dataset...',
+                      flush=True)
+                # ood_pred, ood_conf, ood_gt = self.postprocessor.inference(
+                #     self.net, ood_dl, progress)
+                # self.scores['ood'][ood_split][dataset_name] = [
+                #     ood_pred, ood_conf, ood_gt
+                # ]
+                ood_feats, ood_gt = self.postprocessor.extract_features(
+                    self.net, ood_dl, progress)
+                self.scores['ood'][ood_split][dataset_name] = []
+                for p in params:
+                    self.postprocessor.params = p
+                    ood_pred, ood_conf = self.postprocessor.gibbs_inference(
+                        ood_feats, progress)
+                    # Store scores for each set of params
+                    self.scores['ood'][ood_split][dataset_name].append(
+                        [ood_pred, ood_conf, ood_gt])
+                # Don't store data heavy features
+                del ood_feats
+            else:
+                # print(
+                #     'Inference has been performed on '
+                #     f'{dataset_name} dataset...',
+                #     flush=True)
+                # [ood_pred, ood_conf,
+                #  ood_gt] = self.scores['ood'][ood_split][dataset_name]
+                raise NotImplementedError("Not yet supporting loading scores for gibbs sampling")
+
+            param_metrics = []
+            print(f'Computing metrics on {dataset_name} dataset...')
+            for i in range(len(params)):
+                id_pred, id_conf, id_gt = self.scores['id']['test'][i]
+                ood_pred, ood_conf, ood_gt = self.scores['ood'][ood_split][dataset_name][i]
+                ood_gt = -1 * np.ones_like(ood_gt)  # hard set to -1 as ood
+                pred = np.concatenate([id_pred, ood_pred])
+                conf = np.concatenate([id_conf, ood_conf])
+                label = np.concatenate([id_gt, ood_gt])
+
+                ood_metrics = compute_all_metrics(conf, label, pred)
+                param_metrics.append(ood_metrics)
+            # TODO(rwl93): Add a mean / ensemble metric at the end by averaging
+            # scores across all parameters
+            # Mean over all parameters
+            metrics_list.append(np.array(param_metrics).mean(0))
+            self._print_metrics(param_metrics)
+
+        print('Computing mean metrics...', flush=True)
+        metrics_list = np.array(metrics_list)
+        metrics_mean = np.mean(metrics_list, axis=0, keepdims=True)
+        self._print_metrics(list(metrics_mean[0]))
+        return np.concatenate([metrics_list, metrics_mean], axis=0) * 100
