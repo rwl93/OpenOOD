@@ -5,7 +5,7 @@ postprocessor:
     alpha: 1e-200
     max_cls_conf: False
     sigma0_scale: 1.
-    sigma0_sample_cov: True
+    sigma0_sample_cov: False
     kappa0: 1.
     use_pca: False
     pca_dim: 128
