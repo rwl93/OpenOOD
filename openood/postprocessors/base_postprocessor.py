@@ -47,7 +47,7 @@ class BasePostprocessor:
 
     def _update_params(self):
         for k in self._params.keys():
-            if hasattr(self, k):
+            if not hasattr(self, k):
                 raise AttributeError(f'{k} in params not set in setup or setup not run yet')
             self._params[k] = getattr(self, k)
 
@@ -60,7 +60,7 @@ class BasePostprocessor:
     def params(self, value):
         if self._params.keys() != value.keys():
             raise ValueError("Invalid value for params: Keys do not match.")
-        for k, v in value:
+        for k, v in value.items():
             setattr(self, k, v)
         self._update_params()
 

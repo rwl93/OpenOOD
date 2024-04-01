@@ -1,12 +1,14 @@
 from typing import Callable, List, Type
 
 import os
+import copy
 import numpy as np
 import pandas as pd
+import scipy
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 from openood.evaluators.metrics import compute_all_metrics
 from openood.postprocessors import BasePostprocessor
@@ -476,13 +478,20 @@ class GibbsEvaluator(Evaluator):
 
         # Generate all parameter values
         self.net.eval()
-        params = []
-        for _ in range(self.num_gibbs_samples):
+        params = [copy.deepcopy(self.postprocessor.params)]
+        # for _ in range(self.num_gibbs_samples):
+        for _ in trange(self.num_gibbs_samples,
+                desc="Generating Gibbs Parameters",
+                position=0,
+                leave=False,
+                colour='green',
+                disable=not progress):
             if not hasattr(self.postprocessor, 'gibbs'):
                 raise AttributeError(
                     f'Postprocessor {self.postprocessor_name} does not support Gibbs sampling')
             self.postprocessor.gibbs() # type: ignore
-            params.append(self.postprocessor.params)
+            # Make a copy instead of pointer
+            params.append(copy.deepcopy(self.postprocessor.params))
 
         # Store features from feature extractor for each task if the
         # postprocessor allows for it
@@ -574,9 +583,10 @@ class GibbsEvaluator(Evaluator):
         """NOTE: Changing id_list to actually be gibbs parameters"""
         print(f'Processing {ood_split} ood...', flush=True)
         params = id_list
+        all_param_metrics_list = []
         metrics_list = []
-        for dataset_name, ood_dl in self.dataloader_dict['ood'][
-                ood_split].items():
+        ens_metrics_list = []
+        for dataset_name, ood_dl in self.dataloader_dict['ood'][ ood_split].items():
             if self.scores['ood'][ood_split][dataset_name] is None:
                 print(f'Performing inference on {dataset_name} dataset...',
                       flush=True)
@@ -613,19 +623,52 @@ class GibbsEvaluator(Evaluator):
                 ood_pred, ood_conf, ood_gt = self.scores['ood'][ood_split][dataset_name][i]
                 ood_gt = -1 * np.ones_like(ood_gt)  # hard set to -1 as ood
                 pred = np.concatenate([id_pred, ood_pred])
+                # FIXME: conf = -1 * np.concatenate([id_conf, ood_conf])
                 conf = np.concatenate([id_conf, ood_conf])
                 label = np.concatenate([id_gt, ood_gt])
 
                 ood_metrics = compute_all_metrics(conf, label, pred)
+                # Print ood metrics for each parameter set
+                print(f'Param sample {i}')
+                self._print_metrics(ood_metrics)
                 param_metrics.append(ood_metrics)
-            # TODO(rwl93): Add a mean / ensemble metric at the end by averaging
-            # scores across all parameters
             # Mean over all parameters
+            # param_metrics = List[List[float, 5], "len(params)"]
+            all_param_metrics_list.append(param_metrics)
+            print("Mean over parameters")
             metrics_list.append(np.array(param_metrics).mean(0))
-            self._print_metrics(param_metrics)
+            self._print_metrics(metrics_list[-1])
+            print("Ensemble of parameters")
+            id_scores_all = np.array(self.scores['id']['test'])
+            id_pred = scipy.stats.mode(id_scores_all[:,0,:])[0]
+            id_conf = id_scores_all[:,1,:].mean(0)
+            id_gt = id_scores_all[0,2,:]
+            ood_scores_all = np.array(self.scores['ood'][ood_split][dataset_name])
+            ood_pred = scipy.stats.mode(ood_scores_all[:,0,:])[0]
+            ood_conf = ood_scores_all[:,1,:].mean(0)
+            ood_gt = ood_scores_all[0,2,:]
+            ood_gt = -1 * np.ones_like(ood_gt)  # hard set to -1 as ood
+            pred = np.concatenate([id_pred, ood_pred])
+            # FIXME: conf = -1 * np.concatenate([id_conf, ood_conf])
+            conf = np.concatenate([id_conf, ood_conf])
+            label = np.concatenate([id_gt, ood_gt])
+            ens_ood_metrics = compute_all_metrics(conf, label, pred)
+            ens_metrics_list.append(ens_ood_metrics)
+            self._print_metrics(ens_metrics_list[-1])
 
         print('Computing mean metrics...', flush=True)
+        for i in range(len(params)):
+            param_metrics = [met[i] for met in all_param_metrics_list]
+            param_metrics = np.array(param_metrics) # D, 5
+            metrics_mean = param_metrics.mean(0)
+            print(f'Param sample {i}')
+            self._print_metrics(list(metrics_mean))
+        print('Mean over parameters')
         metrics_list = np.array(metrics_list)
         metrics_mean = np.mean(metrics_list, axis=0, keepdims=True)
         self._print_metrics(list(metrics_mean[0]))
-        return np.concatenate([metrics_list, metrics_mean], axis=0) * 100
+        print('Computing ensemble mean metrics...', flush=True)
+        ens_metrics_list = np.array(metrics_list)
+        ens_metrics_mean = np.mean(ens_metrics_list, axis=0, keepdims=True)
+        self._print_metrics(list(ens_metrics_mean[0]))
+        return np.concatenate([ens_metrics_list, ens_metrics_mean], axis=0) * 100

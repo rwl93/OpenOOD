@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import sklearn.covariance
-from tqdm import tqdm
+from tqdm import tqdm,trange
 
 from .base_postprocessor import BasePostprocessor
 from .info import num_classes_dict
@@ -874,7 +874,7 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
     def __init__(self, config):
         super().__init__(config)
         self.covariance_type = 'tied'
-        self._params.update({"Sigma": None, "mu0": None, "Sigma0": None})
+        self._params.update({"Sigma": None, "mu0": None, "mu": None, "Sigma0": None})
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
@@ -910,15 +910,20 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
 
             self._chol = []
             self.meanN = []
+            self.mu = []
             for k in range(self.num_classes):
                 Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
-                muk = self.Sigma0_inv @ self.mu0 + self.N[k] * self.Sigma_inv @ sample_means[k]
-                self.meanN.append(Sk @ muk)
+                muk_hat = self.Sigma0_inv @ self.mu0 + self.N[k] * self.Sigma_inv @ sample_means[k]
+                muk_hat = Sk @ muk_hat
+                self.meanN.append(muk_hat)
+                muk = np.random.multivariate_normal(muk_hat, Sk)
+                self.mu.append(muk)
                 SigmaN = Sk + self.Sigma
                 self._chol.append(compute_cov_cholesky(SigmaN, self.covariance_type))
             # shape [#classes, feature dim, feature dim]
             self._chol = np.stack(self._chol, 0)
             self.meanN = np.vstack(self.meanN)  # shape [#classes, feature dim]
+            self.mu = np.vstack(self.mu)  # shape [#classes, feature dim]
 
             # Set _priorchol for calculating logpriorpred
             print("Sigma0 for debugging")
@@ -947,14 +952,24 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
         posterior predictive because the other Gibbs samplers use this
         quantity.
         """
+        # NOTE: This mu_k is a sample from the normal dist. The meanN used for
+        # calculating the posterior predictive is the mean of this normal dist.
+        mu = []
         meanN = []
-        for c in range(self.num_classes):
+        for c in trange(self.num_classes,
+                        desc="Sampling Class Means",
+                        position=1,
+                        leave=False,
+                        colour='red',
+                        ):
             Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[c] * self.Sigma_inv)
-            muk = self.Sigma0_inv @ self.mu0 + self.N[c] * self.Sigma_inv @ self.sample_means[c]
-            muk = Sk @ muk
-            mN = np.random.multivariate_normal(muk, Sk)
-            meanN.append(mN)
-        self.meanN = np.vstack(meanN)
+            muk_hat = self.Sigma0_inv @ self.mu0 + self.N[c] * self.Sigma_inv @ self.sample_means[c]
+            muk_hat = Sk @ muk_hat
+            meanN.append(muk_hat)
+            muk = np.random.multivariate_normal(muk_hat, Sk)
+            mu.append(muk)
+        self.meanN = np.vstack(meanN) # This is used for calculating logpostpred
+        self.mu = np.vstack(mu) # This is used for sampling Sigma, Sigma0, mu0
 
     def sample_Sigma(self):
         """Sample Sigma
@@ -966,36 +981,51 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
                 &= \sum_{k=1}^K S_k - m_k \mu_k^\top - \mu_k m_k^\top + N_k \mu_k\mu_k^\top
         """
         nuN = self.nu0 + self.N.sum()
-        ssd = calc_ssd(self.N, self.sumx, self.sumxx, self.meanN, self.dim)
+        ssd = calc_ssd(self.N, self.sumx, self.sumxx, self.mu, self.dim)
+        ssd = ssd.sum(0)
         shape = self.Psi0 + ssd
-        self.Sigma = scipy.stats.invwishart(nuN, shape)
+        self.Sigma = scipy.stats.invwishart(nuN, shape).rvs()
         self.Sigma_inv = scipy.linalg.inv(self.Sigma)
 
         # Update class-wise choleskys
         chol = []
-        for k in range(self.num_classes):
+        # for k in range(self.num_classes):
+        for k in trange(self.num_classes,
+                        desc="Sampling Class Sigmas",
+                        position=1,
+                        leave=False,
+                        colour='blue',
+                        ):
             Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
             Sigmak = Sk + self.Sigma
             chol.append(compute_cov_cholesky(Sigmak, self.covariance_type))
         self._chol = np.stack(chol, 0)
 
     def sample_hyperpriors(self):
-        nutick = self.epsilon + self.num_classes
-        kappatick = self.kappa + self.num_classes
-        mutick = self.meanN.sum(0) / kappatick
-        mukmuk = np.stack([np.outer(m, m) for m in self.meanN], 0)
-        Psitick = self.sigmasq * np.eye(self.dim) + mukmuk.sum(0) \
-            - kappatick * np.outer(mutick, mutick)
-        self.Sigma0 = scipy.stats.invwishart(nutick, Psitick).rvs()
-        self.mu0 = np.random.multivariate_normal(mutick, self.Sigma0 / kappatick)
-        self.Sigma0_inv = scipy.linalg.inv(self.Sigma0)
-        # FIXME: Check that _priorchol isnt Sigma0+Sigma
-        self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+        with tqdm(total=5, desc="Sampling hyperpriors", position=1,
+                  leave=False, colour='cyan') as pbar:
+            nutick = self.epsilon + self.num_classes
+            kappatick = self.kappa + self.num_classes
+            mutick = self.mu.sum(0) / kappatick
+            mukmuk = np.stack([np.outer(m, m) for m in self.mu], 0)
+            Psitick = self.sigmasq * np.eye(self.dim) + mukmuk.sum(0) \
+                - kappatick * np.outer(mutick, mutick)
+            pbar.update(1)
+            self.Sigma0 = scipy.stats.invwishart(nutick, Psitick).rvs()
+            pbar.update(1)
+            self.mu0 = np.random.multivariate_normal(mutick, self.Sigma0 / kappatick)
+            pbar.update(1)
+            self.Sigma0_inv = scipy.linalg.inv(self.Sigma0)
+            pbar.update(1)
+            # Update stored chol(Sigma0+Sigma) for fast inference
+            self._priorchol = compute_cov_cholesky(
+                self.Sigma0 + self.Sigma, self.covariance_type)
+            pbar.update(1)
 
     def gibbs(self):
         self.sample_mu()
-        self.sample_hyperpriors()
         self.sample_Sigma()
+        self.sample_hyperpriors()
 
 
 class FullDPGMMPostprocessor(DPGMM):
