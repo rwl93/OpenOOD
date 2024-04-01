@@ -1072,41 +1072,133 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
     def __init__(self, config):
         super().__init__(config)
         self.covariance_type = 'full'
+        self._params.update({"Sigma0": None, "kappa0": None, "nu0": None, "mu": None})
+        self.num_mh_steps = 20
+        self.nu0_prop_scale = 0.1
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
-            # estimate mean and variance from training set
-            raise NotImplementedError
-            # print('\nEstimating cluster statistics from training set...')
-            # print(f'alpha: {self.alpha}')
-            # sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
+            sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+            self.sumx = sumx
+            self.sumxx = sumxx
+            self.sample_means = sample_means
 
-            # # Calculate class means
-            # kappaN = self.kappa0 + self.N
-            # self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
+            # Calculate class means
+            kappaN = self.kappa0 + self.N
+            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
+            self.mu = np.copy(self.meanN)
 
-            # # Calculate class Sigmas
-            # eps = 1e-5 * np.eye(dim)
-            # self._chol = []
-            # for c in range(self.num_classes):
-            #     # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
-            #     # because sqrt(factor) * chol(Sigma) = chol(factor * Sigma)
-            #     mu0outer = np.outer(self.mu0, self.mu0) + eps
-            #     mNouter = np.outer(self.meanN[c], self.meanN[c])
-            #     SigmaN = self.Sigma0 + self.kappa0 * mu0outer
-            #     SigmaN += sumxx[c]
-            #     SigmaN -= kappaN[c] * mNouter
-            #     SigmaN += 4*eps
-            #     if not ispsd(SigmaN):
-            #         import pdb; pdb.set_trace()
-            #     chol = compute_cov_cholesky(SigmaN, self.covariance_type)
-            #     self._chol.append(chol)
-            # # shape [#classes, feature dim, feature dim]
-            # self._chol = np.stack(self._chol, 0)
-            # self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
-            # self.setup_flag = True
+            # Calculate class Sigmas
+            eps = 1e-5 * np.eye(self.dim)
+            self._chol = []
+            for c in range(self.num_classes):
+                # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
+                # because sqrt(factor) * chol(Sigma) = chol(factor * Sigma)
+                mu0outer = np.outer(self.mu0, self.mu0) + eps
+                mNouter = np.outer(self.meanN[c], self.meanN[c])
+                SigmaN = self.Sigma0 + self.kappa0 * mu0outer
+                SigmaN += sumxx[c]
+                SigmaN -= kappaN[c] * mNouter
+                SigmaN += 4*eps # FIXME: Can this be done better?
+                if not ispsd(SigmaN):
+                    import pdb; pdb.set_trace()
+                chol = compute_cov_cholesky(SigmaN, self.covariance_type)
+                self._chol.append(chol)
+            # shape [#classes, feature dim, feature dim]
+            self._chol = np.stack(self._chol, 0)
+            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+            self.setup_flag = True
         else:
             pass
+
+    def sample_cluster_params(self):
+        """Sample mu and Sigma for each class
+
+        Note
+        ----
+        We need to do this despite it being integrated out in the
+        posterior predictive because the other Gibbs samplers use this
+        quantity.
+        """
+        # NOTE: This mu_k is a sample from the normal dist. The meanN used for
+        # calculating the posterior predictive is the mean of this normal dist.
+        K = self.N.shape[0]
+        nu_post = self.nu0 + self.N
+        kappa_post = self.kappa0 + self.N
+        mu_post =  (self.kappa0 * self.mu0 + self.sumx) / kappa_post[:, None]
+        Sigma_post = self.Sigma0 + self.kappa0 * np.outer(self.mu0, self.mu0)
+        Sigma_post += self.sumxx
+        Sigma_post -= kappa_post[:, None, None] * np.einsum('ki,kj->kij', mu_post, mu_post)
+
+        covs = np.array([scipy.stats.invwishart(nu_post[i], Sigma_post[i]).rvs()
+                         for i in range(K)])
+        self._chol = compute_cov_cholesky(covs, covariance_type=self.covariance_type)
+        self.mu = np.vstack([
+            np.random.multivariate_normal(
+                mu_post[i], covs / kappa_post[:, None, None])
+            for i in range(K)])
+
+    def sample_Sigma0(self, precisions):
+        df = self.N.shape[0] * self.nu0 + self.dim + 1
+        # Calculate sum of covs
+        sum_prec = precisions.sum(0)
+        loc = np.linalg.inv(sum_prec)
+        self.Sigma0 = scipy.stats.wishart(df, loc).rvs()
+        self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+
+    def sample_mh_nu0(self):
+        num_clusters = self.N.shape[0]
+        logdet_Sigma0 = 2 * np.log(np.diagonal(self._priorchol)).sum()
+        logdet_Sigmas = 2 * np.log(np.diagonal(self._chol, axis1=1, axis2=2)).sum(-1)
+
+        def _target(nu0):
+            if nu0 <= 0.0: return - np.inf
+            lp = -0.5 * nu0 * num_clusters * self.dim * np.log(2.)
+            lp -= num_clusters * scipy.special.multigammaln(0.5 * nu0, self.dim)
+            lp += 0.5 * nu0 * np.sum(logdet_Sigma0 - logdet_Sigmas)
+            return lp
+
+        nu0 = self.nu0
+        curr_lp = _target(nu0)
+        for _ in range(self.num_mh_steps):
+            prop_nu0 = np.random.normal(nu0, self.nu0_prop_scale)
+            prop_lp = _target(prop_nu0)
+            if np.log(np.random.uniform()) < prop_lp - curr_lp:
+                nu0 = prop_nu0
+                curr_lp = prop_lp
+        self.nu0 = nu0
+
+    def sample_mu0(self, precisions):
+        Sigma_post = np.linalg.inv(precisions.sum(0)) / self.kappa0
+        # FIXME: Track mus separately. meanN is 1/kappaN * (kappa0 * mu0 + sumx)
+        mu_post = Sigma_post @ (self.kappa0 * np.einsum('kij,kj->i', precisions, self.mu))
+        self.mu0 = np.random.multivariate_normal(mu_post, Sigma_post)
+
+    def sample_kappa0(self, precisions):
+        num_clusters = self.N.shape[0]
+        Js = precisions
+        diffs = self.mu - self.mu0
+        alpha_post = 0.5 * self.dim * num_clusters + 1.0
+        beta_post = 0.5 * np.einsum('kij,ki,kj->', Js, diffs, diffs)
+        self.kappa0 = np.random.gamma(alpha_post, 1./beta_post)
+
+    def update_meanN(self):
+        kappa_post = self.kappa0 + self.N
+        self.meanN = (self.kappa0 * self.mu0 + self.sumx) / kappa_post[:, None]
+
+    def gibbs(self):
+        self.sample_cluster_params()
+        inv_chol = np.array([
+            scipy.linalg.solve_triangular(L, np.eye(self.dim), lower=True)
+            for L in self._chol])
+        precisions = np.einsum('ijk,ijl->ikl', inv_chol, inv_chol)
+        self.sample_Sigma0(precisions)
+        self.sample_mh_nu0()
+        self.sample_mu0(precisions)
+        self.sample_kappa0(precisions)
+        self.update_meanN()
 
 
 class DiagDPGMMPostprocessor(DPGMM):
