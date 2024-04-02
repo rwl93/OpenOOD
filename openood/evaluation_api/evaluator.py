@@ -2,6 +2,7 @@ from typing import Callable, List, Type
 
 import os
 import copy
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 import scipy
@@ -463,6 +464,17 @@ class GibbsEvaluator(Evaluator):
                          shuffle, num_workers)
         self._num_gibbs_samples = 1
         self.postprocessor_name = postprocessor_name
+        self.ood_feats = defaultdict(lambda: {})
+        self._ood_calc_inprogress = defaultdict(lambda: {})
+        self.param_metrics = {
+            'ood': {
+                'near': [],
+                'far': [],
+            },
+            'id_acc': [],
+            'csid_acc': [],
+            'fsood': [],
+        }
 
     @property
     def num_gibbs_samples(self):
@@ -478,40 +490,17 @@ class GibbsEvaluator(Evaluator):
 
         # Generate all parameter values
         self.net.eval()
-        params = [copy.deepcopy(self.postprocessor.params)]
-        # for _ in range(self.num_gibbs_samples):
-        for _ in trange(self.num_gibbs_samples,
-                desc="Generating Gibbs Parameters",
-                position=0,
-                leave=False,
-                colour='green',
-                disable=not progress):
-            if not hasattr(self.postprocessor, 'gibbs'):
-                raise AttributeError(
-                    f'Postprocessor {self.postprocessor_name} does not support Gibbs sampling')
-            self.postprocessor.gibbs() # type: ignore
-            # Make a copy instead of pointer
-            params.append(copy.deepcopy(self.postprocessor.params))
-
         # Store features from feature extractor for each task if the
         # postprocessor allows for it
         if self.metrics[task] is None:
             # id score
             if self.scores['id']['test'] is None:
-                print(f'Performing inference on {self.id_name} test set...',
+                print(f'Extracting features on {self.id_name} test set...',
                       flush=True)
                 # Gather features
+                self.scores['id']['test'] = []
                 id_feats, id_gt = self.postprocessor.extract_features(
                     self.net, self.dataloader_dict['id']['test'], progress)
-                self.scores['id']['test'] = []
-                for p in params:
-                    self.postprocessor.params = p
-                    id_pred, id_conf = self.postprocessor.gibbs_inference(
-                        id_feats, progress)
-                    # Store scores for each set of params
-                    self.scores['id']['test'].append([id_pred, id_conf, id_gt])
-                # Don't store data heavy features
-                del id_feats
             else:
                 # id_pred, id_conf, id_gt = self.scores['id']['test']
                 raise NotImplementedError("Not yet supporting loading scores for gibbs sampling")
@@ -546,67 +535,173 @@ class GibbsEvaluator(Evaluator):
                 # id_gt = np.concatenate((id_gt, csid_gt))
                 raise NotImplementedError("Not yet supporting FSOOD for gibbs sampling")
 
-            # load nearood data and compute ood metrics
-            near_metrics = self._eval_ood(params,
-                                          ood_split='near',
-                                          progress=progress)
-            # load farood data and compute ood metrics
-            far_metrics = self._eval_ood(params,
-                                         ood_split='far',
-                                         progress=progress)
+            # Extract features from all ood datasets
+            self._extract_ood(ood_split='near', progress=progress)
+            self._extract_ood(ood_split='far', progress=progress)
 
-            if self.metrics[f'{id_name}_acc'] is None:
-                self.metrics[f'{id_name}_acc'] = near_metrics[0,-1]
+            # Draw new Gibbs sample and calculate ood scores
+            # params = [copy.deepcopy(self.postprocessor.params)]
+            for i in trange(self.num_gibbs_samples,
+                    desc=f'Gather OOD Metrics for Gibbs Sample',
+                    position=0,
+                    leave=False,
+                    colour='green',
+                    disable=not progress):
+                if not hasattr(self.postprocessor, 'gibbs'):
+                    raise AttributeError(
+                        f'Postprocessor {self.postprocessor_name} does not support Gibbs sampling')
+                self.postprocessor.gibbs() # type: ignore
+                # No longer storing params: # Make a copy instead of pointer
+                # params.append(copy.deepcopy(self.postprocessor.params))
+                # self.postprocessor.params = p
+                id_pred, id_conf = self.postprocessor.gibbs_inference(
+                    id_feats, progress)
+                # Store scores for each set of params
+                self.scores['id']['test'].append([id_pred, id_conf, id_gt])
 
-            self.metrics[task] = pd.DataFrame(
-                np.concatenate([near_metrics, far_metrics], axis=0),
+                near_metrics = self._eval_ood([id_pred, id_conf, id_gt],
+                                              ood_split='near',
+                                              progress=progress,
+                                              gibbs_sample=i)
+                far_metrics = self._eval_ood([id_pred, id_conf, id_gt],
+                                             ood_split='far',
+                                             progress=progress)
+                self.param_metrics[f'{id_name}_acc'].append(near_metrics[0,-1])
+                # if self.metrics[f'{id_name}_acc'] is None:
+                #     self.metrics[f'{id_name}_acc'] = near_metrics[0,-1]
+
+            # Mean over all parameters
+            # self.param_metrics = List[Array[float, "#DSETS, 5"], "len(params)"]
+            # pmean_* = Array[float, "#DSETS + 1, 5"]
+            pmean_near = np.array(self.param_metrics['ood']['near']).mean(0)
+            mean_pmean_near = pmean_near.mean(0, keepdims=True)
+            pmean_near = np.concatenate((pmean_near, mean_pmean_near), 0)
+            pmean_far = np.array(self.param_metrics['ood']['far']).mean(0)
+            mean_pmean_far = pmean_near.mean(0, keepdims=True)
+            pmean_far = np.concatenate((pmean_far, mean_pmean_far), 0)
+            self.pmean_metrics = pd.DataFrame(
+                np.concatenate([pmean_near, pmean_far], axis=0),
                 index=list(self.dataloader_dict['ood']['near'].keys()) +
                 ['nearood'] + list(self.dataloader_dict['ood']['far'].keys()) +
                 ['farood'],
                 columns=['FPR@95', 'AUROC', 'AUPR_IN', 'AUPR_OUT', 'ACC'],
             )
+
+            # Ensemble over all parameters
+            ens_metrics = {'near': [], 'far': []}
+            id_scores_all = np.array(self.scores['id']['test'])
+            id_pred = scipy.stats.mode(id_scores_all[:,0,:])[0]
+            id_conf = id_scores_all[:,1,:].mean(0)
+            id_gt = id_scores_all[0,2,:]
+            near_dsets = list(self.dataloader_dict['ood']['near'].keys())
+            far_dsets = list(self.dataloader_dict['ood']['far'].keys())
+            all_dsets = near_dsets + far_dsets
+            splits = len(near_dsets) * ['near'] + len(far_dsets) * ['far']
+            for ood_split, dset in zip(splits, all_dsets):
+                ood_scores = np.array(self.scores['ood'][ood_split][dset])
+                ood_pred = scipy.stats.mode(ood_scores[:,0,:])[0]
+                ood_conf = ood_scores[:,1,:].mean(0)
+                ood_gt = ood_scores[0,2,:]
+                ood_gt = -1 * np.ones_like(ood_gt)  # hard set to -1 as ood
+                pred = np.concatenate([id_pred, ood_pred])
+                conf = np.concatenate([id_conf, ood_conf])
+                label = np.concatenate([id_gt, ood_gt])
+                oodmets = compute_all_metrics(conf, label, pred)
+                ens_metrics[ood_split].append(oodmets)
+            ens_near = np.array(ens_metrics['near'])
+            ens_mean_near = ens_near.mean(0, keepdims=True)
+            ens_near = np.concatenate((ens_near, ens_mean_near), 0)
+            ens_far = np.array(ens_metrics['far'])
+            ens_mean_far = ens_far.mean(0, keepdims=True)
+            ens_far = np.concatenate((ens_far, ens_mean_far), 0)
+            self.ens_metrics = pd.DataFrame(
+                np.concatenate([ens_near, ens_far], axis=0),
+                index=list(self.dataloader_dict['ood']['near'].keys()) +
+                ['nearood'] + list(self.dataloader_dict['ood']['far'].keys()) +
+                ['farood'],
+                columns=['FPR@95', 'AUROC', 'AUPR_IN', 'AUPR_OUT', 'ACC'],
+            )
+
+            # Metrics for all parameters
+            # pm_near = Array[float, "gibbs_num_samples, #Dsets, 5"]
+            pm_near = np.array(self.param_metrics['ood']['near'])
+            # pm_near_mean = Array[float, "gibbs_num_samples, 1, 5"]
+            pm_near_mean = pm_near.mean(1, keepdims=True)
+            # pm_near = Array[float, "gibbs_num_samples, #Dsets+1, 5"]
+            pm_near = np.concatenate((pm_near, pm_near_mean), 1)
+            pm_far = np.array(self.param_metrics['ood']['far'])
+            pm_far_mean = pm_far.mean(1, keepdims=True)
+            pm_far = np.concatenate((pm_far, pm_far_mean), 1)
+            data = np.concatenate((pm_near, pm_far), 1)
+            # Add ensemble metrics Array[float, "NDsets Far+Near, 5"]
+            ensmet = np.concatenate([ens_near, ens_far], axis=0)
+            data = np.concatenate((data, ensmet[np.newaxis, :, :]), 0)
+            # data = Array[float, "gibbs_num_samples + 1, #Dsets Far+Near, 5"]
+            majcol = [f'sample{i}' for i in range(self.num_gibbs_samples)] + ['ensemble']
+            majcol = np.repeat(majcol, 5)
+            mincol = ['FPR@95', 'AUROC', 'AUPR_IN', 'AUPR_OUT', 'ACC'] * data.shape[0]
+            cols = pd.MultiIndex.from_tuples(zip(majcol, mincol))
+            index = list(self.dataloader_dict['ood']['near'].keys()) + \
+                ['nearood'] + \
+                list(self.dataloader_dict['ood']['far'].keys()) + \
+                ['farood']
+            data = data.transpose(1,0,2)
+            data = data.reshape(data.shape[0], -1)
+            self.metrics[task] = pd.DataFrame(data=data, columns=cols, index=index)
         else:
             print('Evaluation has already been done!')
+
+
 
         with pd.option_context(
                 'display.max_rows', None, 'display.max_columns', None,
                 'display.float_format',
                 '{:,.2f}'.format):  # more options can be specified also
+            print("Mean over parameters")
+            print(self.pmean_metrics)
+            print("Ensemble of parameters")
+            print(self.ens_metrics)
+            print("All parameters")
             print(self.metrics[task])
-
         return self.metrics[task]
+
+    def _extract_ood(self,
+                     ood_split: str = 'near',
+                     progress: bool = True):
+        """NOTE: Changing id_list to actually be gibbs parameters"""
+        print(f'Processing {ood_split} ood...', flush=True)
+        for dataset_name, ood_dl in self.dataloader_dict['ood'][ ood_split].items():
+            if self.scores['ood'][ood_split][dataset_name] is None:
+                print(f'Extracting features from {dataset_name} dataset...',
+                      flush=True)
+                ood_feats, ood_gt = self.postprocessor.extract_features(
+                    self.net, ood_dl, progress)
+                self.ood_feats[ood_split][dataset_name] = [ood_feats, ood_gt]
 
     def _eval_ood(self,
                   id_list: List[np.ndarray],
                   ood_split: str = 'near',
-                  progress: bool = True):
+                  progress: bool = True,
+                  gibbs_sample: int = 0):
         """NOTE: Changing id_list to actually be gibbs parameters"""
         print(f'Processing {ood_split} ood...', flush=True)
-        params = id_list
-        all_param_metrics_list = []
         metrics_list = []
-        ens_metrics_list = []
+        id_pred, id_conf, id_gt = id_list
         for dataset_name, ood_dl in self.dataloader_dict['ood'][ ood_split].items():
-            if self.scores['ood'][ood_split][dataset_name] is None:
-                print(f'Performing inference on {dataset_name} dataset...',
+            if (self.scores['ood'][ood_split][dataset_name] is None) or (
+                    self._ood_calc_inprogress[ood_split][dataset_name]):
+                if self.scores['ood'][ood_split][dataset_name] is None:
+                    self.scores['ood'][ood_split][dataset_name] = []
+                    self._ood_calc_inprogress[ood_split][dataset_name] = True
+                print(f'Calculating OOD scores {dataset_name} dataset...',
                       flush=True)
-                # ood_pred, ood_conf, ood_gt = self.postprocessor.inference(
-                #     self.net, ood_dl, progress)
-                # self.scores['ood'][ood_split][dataset_name] = [
-                #     ood_pred, ood_conf, ood_gt
-                # ]
-                ood_feats, ood_gt = self.postprocessor.extract_features(
-                    self.net, ood_dl, progress)
-                self.scores['ood'][ood_split][dataset_name] = []
-                for p in params:
-                    self.postprocessor.params = p
-                    ood_pred, ood_conf = self.postprocessor.gibbs_inference(
-                        ood_feats, progress)
-                    # Store scores for each set of params
-                    self.scores['ood'][ood_split][dataset_name].append(
-                        [ood_pred, ood_conf, ood_gt])
-                # Don't store data heavy features
-                del ood_feats
+                # Load ood features
+                ood_feats, ood_gt = self.ood_feats[ood_split][dataset_name]
+                ood_pred, ood_conf = self.postprocessor.gibbs_inference(
+                    ood_feats, progress)
+                # Store scores for each set of params
+                self.scores['ood'][ood_split][dataset_name].append(
+                    [ood_pred, ood_conf, ood_gt])
             else:
                 # print(
                 #     'Inference has been performed on '
@@ -616,59 +711,19 @@ class GibbsEvaluator(Evaluator):
                 #  ood_gt] = self.scores['ood'][ood_split][dataset_name]
                 raise NotImplementedError("Not yet supporting loading scores for gibbs sampling")
 
-            param_metrics = []
             print(f'Computing metrics on {dataset_name} dataset...')
-            for i in range(len(params)):
-                id_pred, id_conf, id_gt = self.scores['id']['test'][i]
-                ood_pred, ood_conf, ood_gt = self.scores['ood'][ood_split][dataset_name][i]
-                ood_gt = -1 * np.ones_like(ood_gt)  # hard set to -1 as ood
-                pred = np.concatenate([id_pred, ood_pred])
-                # FIXME: conf = -1 * np.concatenate([id_conf, ood_conf])
-                conf = np.concatenate([id_conf, ood_conf])
-                label = np.concatenate([id_gt, ood_gt])
-
-                ood_metrics = compute_all_metrics(conf, label, pred)
-                # Print ood metrics for each parameter set
-                print(f'Param sample {i}')
-                self._print_metrics(ood_metrics)
-                param_metrics.append(ood_metrics)
-            # Mean over all parameters
-            # param_metrics = List[List[float, 5], "len(params)"]
-            all_param_metrics_list.append(param_metrics)
-            print("Mean over parameters")
-            metrics_list.append(np.array(param_metrics).mean(0))
-            self._print_metrics(metrics_list[-1])
-            print("Ensemble of parameters")
-            id_scores_all = np.array(self.scores['id']['test'])
-            id_pred = scipy.stats.mode(id_scores_all[:,0,:])[0]
-            id_conf = id_scores_all[:,1,:].mean(0)
-            id_gt = id_scores_all[0,2,:]
-            ood_scores_all = np.array(self.scores['ood'][ood_split][dataset_name])
-            ood_pred = scipy.stats.mode(ood_scores_all[:,0,:])[0]
-            ood_conf = ood_scores_all[:,1,:].mean(0)
-            ood_gt = ood_scores_all[0,2,:]
             ood_gt = -1 * np.ones_like(ood_gt)  # hard set to -1 as ood
             pred = np.concatenate([id_pred, ood_pred])
-            # FIXME: conf = -1 * np.concatenate([id_conf, ood_conf])
             conf = np.concatenate([id_conf, ood_conf])
             label = np.concatenate([id_gt, ood_gt])
-            ens_ood_metrics = compute_all_metrics(conf, label, pred)
-            ens_metrics_list.append(ens_ood_metrics)
-            self._print_metrics(ens_metrics_list[-1])
+            ood_metrics = compute_all_metrics(conf, label, pred)
+            metrics_list.append(ood_metrics)
+            # Print ood metrics for each parameter set
+            self._print_metrics(ood_metrics)
 
         print('Computing mean metrics...', flush=True)
-        for i in range(len(params)):
-            param_metrics = [met[i] for met in all_param_metrics_list]
-            param_metrics = np.array(param_metrics) # D, 5
-            metrics_mean = param_metrics.mean(0)
-            print(f'Param sample {i}')
-            self._print_metrics(list(metrics_mean))
-        print('Mean over parameters')
         metrics_list = np.array(metrics_list)
         metrics_mean = np.mean(metrics_list, axis=0, keepdims=True)
         self._print_metrics(list(metrics_mean[0]))
-        print('Computing ensemble mean metrics...', flush=True)
-        ens_metrics_list = np.array(metrics_list)
-        ens_metrics_mean = np.mean(ens_metrics_list, axis=0, keepdims=True)
-        self._print_metrics(list(ens_metrics_mean[0]))
-        return np.concatenate([ens_metrics_list, ens_metrics_mean], axis=0) * 100
+        self.param_metrics['ood'][ood_split].append(metrics_list)
+        return np.concatenate([metrics_list, metrics_mean], axis=0) * 100
