@@ -598,6 +598,8 @@ class DPGMM(BasePostprocessor):
         self.sigma0_sample_cov = self.args.sigma0_sample_cov
         self.kappa0 = self.args.kappa0
         self.use_pca = self.args.use_pca
+        if self.use_pca:
+            print(f'PCA Dimension: {self.args.pca_dim}')
         self.pca_dim = self.args.pca_dim
         self.args_dict = self.config.postprocessor.postprocessor_sweep
         self._params = {"_chol": None, "_priorchol": None, "mu0": None, "meanN": None}
@@ -842,13 +844,13 @@ class TiedDPGMMPostprocessor(DPGMM):
             Sigma_mean = Sigma * factor
 
             # Calculate Sk, meanN, SigmaN
-            Sigma0_inv = scipy.linalg.inv(self.Sigma0)
-            Sigma_inv = scipy.linalg.inv(Sigma_mean)
+            Sigma0_inv = np.linalg.inv(self.Sigma0)
+            Sigma_inv = np.linalg.inv(Sigma_mean)
 
             self._chol = []
             self.meanN = []
             for k in range(self.num_classes):
-                Sk = scipy.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
+                Sk = np.linalg.inv(Sigma0_inv + self.N[k] * Sigma_inv)
                 muk = Sigma0_inv @ self.mu0 + self.N[k] * Sigma_inv @ sample_means[k]
                 self.meanN.append(Sk @ muk)
                 SigmaN = Sk + Sigma_mean
@@ -905,14 +907,14 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
             self.Sigma0 = Psi_tick / (nu_tick - self.dim - 1)
 
             # Calculate Sk, meanN, SigmaN
-            self.Sigma0_inv = scipy.linalg.inv(self.Sigma0)
-            self.Sigma_inv = scipy.linalg.inv(self.Sigma)
+            self.Sigma0_inv = np.linalg.inv(self.Sigma0)
+            self.Sigma_inv = np.linalg.inv(self.Sigma)
 
             self._chol = []
             self.meanN = []
             self.mu = []
             for k in range(self.num_classes):
-                Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
+                Sk = np.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
                 muk_hat = self.Sigma0_inv @ self.mu0 + self.N[k] * self.Sigma_inv @ sample_means[k]
                 muk_hat = Sk @ muk_hat
                 self.meanN.append(muk_hat)
@@ -962,7 +964,7 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
                         leave=False,
                         colour='red',
                         ):
-            Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[c] * self.Sigma_inv)
+            Sk = np.linalg.inv(self.Sigma0_inv + self.N[c] * self.Sigma_inv)
             muk_hat = self.Sigma0_inv @ self.mu0 + self.N[c] * self.Sigma_inv @ self.sample_means[c]
             muk_hat = Sk @ muk_hat
             meanN.append(muk_hat)
@@ -985,7 +987,7 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
         ssd = ssd.sum(0)
         shape = self.Psi0 + ssd
         self.Sigma = scipy.stats.invwishart(nuN, shape).rvs()
-        self.Sigma_inv = scipy.linalg.inv(self.Sigma)
+        self.Sigma_inv = np.linalg.inv(self.Sigma)
 
         # Update class-wise choleskys
         chol = []
@@ -996,7 +998,7 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
                         leave=False,
                         colour='blue',
                         ):
-            Sk = scipy.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
+            Sk = np.linalg.inv(self.Sigma0_inv + self.N[k] * self.Sigma_inv)
             Sigmak = Sk + self.Sigma
             chol.append(compute_cov_cholesky(Sigmak, self.covariance_type))
         self._chol = np.stack(chol, 0)
@@ -1015,7 +1017,7 @@ class FullyBayesianTiedDPGMMPostprocessor(DPGMM):
             pbar.update(1)
             self.mu0 = np.random.multivariate_normal(mutick, self.Sigma0 / kappatick)
             pbar.update(1)
-            self.Sigma0_inv = scipy.linalg.inv(self.Sigma0)
+            self.Sigma0_inv = np.linalg.inv(self.Sigma0)
             pbar.update(1)
             # Update stored chol(Sigma0+Sigma) for fast inference
             self._priorchol = compute_cov_cholesky(
@@ -1045,7 +1047,7 @@ class FullDPGMMPostprocessor(DPGMM):
             self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
 
             # Calculate class Sigmas
-            eps = 1e-5 * np.eye(dim)
+            eps = 1e-5 * np.eye(self.dim)
             self._chol = []
             for c in range(self.num_classes):
                 # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
@@ -1072,7 +1074,11 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
     def __init__(self, config):
         super().__init__(config)
         self.covariance_type = 'full'
-        self._params.update({"Sigma0": None, "kappa0": None, "nu0": None, "mu": None})
+        # NOTE: mu and Sigmak are used as solely for updating the hyperprior
+        # quantities. They are not used in log prior or posterior predictive
+        # calculations because they are integrated over.
+        self._params.update({"Sigma0": None, "kappa0": None, "nu0": None,
+            "mu": None, "Sigmak": None})
         self.num_mh_steps = 20
         self.nu0_prop_scale = 0.1
 
@@ -1081,34 +1087,98 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
             print('\nEstimating cluster statistics from training set...')
             print(f'alpha: {self.alpha}')
             sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+            # self.nu0 = 40. # Hard set nu0 prior
             self.sumx = sumx
             self.sumxx = sumxx
             self.sample_means = sample_means
 
-            # Calculate class means
+            # STEP 1: Estimate class-wise means and covs from sample stats and
+            # uninformative priors as their respective means
             kappaN = self.kappa0 + self.N
-            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:,np.newaxis]
-            self.mu = np.copy(self.meanN)
-
-            # Calculate class Sigmas
+            self.mu = (self.kappa0 * self.mu0 + sumx) / kappaN[:, None]
+            nuN = self.nu0 + self.N
             eps = 1e-5 * np.eye(self.dim)
-            self._chol = []
-            for c in range(self.num_classes):
-                # NOTE: Store cholesky of Sigma_N not factor * Sigma_N
-                # because sqrt(factor) * chol(Sigma) = chol(factor * Sigma)
-                mu0outer = np.outer(self.mu0, self.mu0) + eps
-                mNouter = np.outer(self.meanN[c], self.meanN[c])
-                SigmaN = self.Sigma0 + self.kappa0 * mu0outer
-                SigmaN += sumxx[c]
-                SigmaN -= kappaN[c] * mNouter
-                SigmaN += 4*eps # FIXME: Can this be done better?
-                if not ispsd(SigmaN):
-                    import pdb; pdb.set_trace()
-                chol = compute_cov_cholesky(SigmaN, self.covariance_type)
-                self._chol.append(chol)
-            # shape [#classes, feature dim, feature dim]
-            self._chol = np.stack(self._chol, 0)
+            mu0outer = np.outer(self.mu0, self.mu0) + eps
+            Sigma_post = self.Sigma0 + self.kappa0 * mu0outer
+            Sigma_post = Sigma_post[None, :, :] + self.sumxx
+            Sigma_post -= kappaN[:, None, None] * np.einsum(
+                'ki,kj->kij', self.mu, self.mu)
+            # FIXME: Is there a better way to do this?
+            Sigma_post += 1e-4 * np.eye(self.dim)
+            if (nuN <= self.dim + 1.).any():
+                raise ValueError("Invalid nuN value. Must be > dim + 1")
+            self.Sigmak = Sigma_post / (nuN - self.dim - 1.)[:, None, None]
+
+            # STEP 2: Update priors: Sigma0/_priorchol, mu0, kappa0, nu0 as
+            # their respective means and the MLE for nu0
+            # Sigma0 := mean( W(K*nu0 + D + 1, inv(sum(prec_k)) ) )
+            #         = (K*nu0 + D + 1) * inv(sum(prec_k))
+            K = self.N.shape[0]
+            Js = np.linalg.inv(self.Sigmak)
+            Js_sum = Js.sum(0)
+            Js_sum_inv = np.linalg.inv(Js_sum)
+            factor = K * self.nu0 + self.dim + 1.
+            # NOTE: This factor is going to be very large:
+            # 1000 * 768 + 768 + 1 = 768769
+            print(f'Sigma0 Wishart df = {factor}')
+            self.Sigma0 = factor * Js_sum_inv
             self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+            # mu0 := mean(N(inv(J)h, inv(J))) = inv(J)h
+            # J := kappa0 * sum_k(prec_k)
+            # h := kappa0 * sum_k(prec_k @ mu_k)
+            J_inv_mu0 = Js_sum_inv / self.kappa0 # (D,D)
+            h_mu0 = self.kappa0 * np.einsum('kij,kj->i', Js, self.mu) # (D,)
+            self.mu0 = J_inv_mu0 @ h_mu0
+            # kappa0 := mean(Ga(DK/2 + 1, 1/2 sum((muk-mu0)^T inv(Sigmak) (muk-mu0)) ) )
+            #         = (DK/2 + 1) /  (1/2 sum((muk-mu0)^T inv(Sigmak) (muk-mu0)))
+            alpha = (self.dim * K * 0.5) + 1.
+            diffs = self.mu - self.mu0
+            beta = 0.5 * np.einsum('kij,ki,kj->', Js, diffs, diffs)
+            self.kappa0 = alpha / beta
+            print(f'kappa0: {self.kappa0}')
+            # nu0: MLE of IW (Sigma_k | nu0, Sigma0)
+            # Output plot data of Loglikelihood vs MLE nu0
+            # MLE Sigma0 @ nu0 = inverse((1 / nu0) * mean(cluster precision))
+            print("Running MLE for nu0 and Sigma0 estimates")
+            Jbar_inv = Js_sum_inv * K
+            def calc_loglik(nu):
+                return -scipy.stats.invwishart.logpdf(
+                    self.Sigmak.transpose(1,2,0),
+                    df=nu, scale=nu * Jbar_inv).sum()
+            nu0s = np.linspace(self.dim, 1500, 100)
+            logliks = []
+            for nu in tqdm(nu0s,
+                           desc='Calculate Loglikelihoods of IW(Sigma_k | nu, Sigma)',
+                           position=0,
+                           leave=False,
+                          ):
+                logliks.append(calc_loglik(nu))
+            fname = 'DPGMMHierarchical-nu0-Sigma0-likelihoods.pkl'
+            fname = os.path.join(os.getcwd(), fname)
+            if os.path.isfile(fname):
+                print(f'Moving old files to backup: {fname+".bkp"}')
+                os.rename(fname, fname+'.bkp')
+            torch.save({
+                'nu0': nu0s,
+                'loglik': logliks,
+            }, fname)
+            res = scipy.optimize.minimize_scalar(calc_loglik,
+                bounds=(float(self.dim), 1200.))
+            self.nu0 = res.x
+            print(f'nu0 optimization result: {res}')
+
+            # STEP 3: Update prior/posterior predictive stats
+            kappa_post = self.kappa0 + self.N
+            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:, None]
+            nu_post = self.nu0 + self.N
+            eps = 1e-5 * np.eye(self.dim)
+            mu0outer = np.outer(self.mu0, self.mu0) + eps
+            Sigma_post = self.Sigma0 + self.kappa0 * mu0outer
+            Sigma_post = Sigma_post[None, :, :] + self.sumxx
+            Sigma_post -= kappaN[:, None, None] * np.einsum(
+                'ki,kj->kij', self.mu, self.mu)
+            Sigma_post += 1e-4 * np.eye(self.dim)
+            self._chol = compute_cov_cholesky(Sigma_post, self.covariance_type)
             self.setup_flag = True
         else:
             pass
@@ -1129,15 +1199,15 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         kappa_post = self.kappa0 + self.N
         mu_post =  (self.kappa0 * self.mu0 + self.sumx) / kappa_post[:, None]
         Sigma_post = self.Sigma0 + self.kappa0 * np.outer(self.mu0, self.mu0)
-        Sigma_post += self.sumxx
+        Sigma_post = Sigma_post[np.newaxis, :, :] + self.sumxx
         Sigma_post -= kappa_post[:, None, None] * np.einsum('ki,kj->kij', mu_post, mu_post)
-
+        # FIXME: Is there a better way to do this?
+        Sigma_post += 1e-4 * np.eye(self.dim)
         covs = np.array([scipy.stats.invwishart(nu_post[i], Sigma_post[i]).rvs()
                          for i in range(K)])
-        self._chol = compute_cov_cholesky(covs, covariance_type=self.covariance_type)
+        self.Sigmak = covs
         self.mu = np.vstack([
-            np.random.multivariate_normal(
-                mu_post[i], covs / kappa_post[:, None, None])
+            np.random.multivariate_normal(mu_post[i], covs[i] / kappa_post[i])
             for i in range(K)])
 
     def sample_Sigma0(self, precisions):
@@ -1148,16 +1218,20 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         self.Sigma0 = scipy.stats.wishart(df, loc).rvs()
         self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
 
-    def sample_mh_nu0(self):
+    def sample_mh_nu0(self, logdet_Sigma0, logdet_Sigmak):
         num_clusters = self.N.shape[0]
-        logdet_Sigma0 = 2 * np.log(np.diagonal(self._priorchol)).sum()
-        logdet_Sigmas = 2 * np.log(np.diagonal(self._chol, axis1=1, axis2=2)).sum(-1)
+        # logdet_Sigma0 = 2 * np.log(np.diagonal(self._priorchol)).sum()
+        # BUG! Must use Sigmak samples NOT Sigma post
+        # logdet_Sigmak = 2 * np.log(np.diagonal(self._chol, axis1=1, axis2=2)).sum(-1)
+        # FIXME: TODO: Move this to gibbs method and calculate precisions and logdet
+        # from the cholesky to avoid duplicate computation
+        # logdet_Sigmak = np.linalg.det(self.Sigmak)
 
         def _target(nu0):
             if nu0 <= 0.0: return - np.inf
             lp = -0.5 * nu0 * num_clusters * self.dim * np.log(2.)
             lp -= num_clusters * scipy.special.multigammaln(0.5 * nu0, self.dim)
-            lp += 0.5 * nu0 * np.sum(logdet_Sigma0 - logdet_Sigmas)
+            lp += 0.5 * nu0 * np.sum(logdet_Sigma0 - logdet_Sigmak)
             return lp
 
         nu0 = self.nu0
@@ -1171,10 +1245,10 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         self.nu0 = nu0
 
     def sample_mu0(self, precisions):
-        Sigma_post = np.linalg.inv(precisions.sum(0)) / self.kappa0
-        # FIXME: Track mus separately. meanN is 1/kappaN * (kappa0 * mu0 + sumx)
-        mu_post = Sigma_post @ (self.kappa0 * np.einsum('kij,kj->i', precisions, self.mu))
-        self.mu0 = np.random.multivariate_normal(mu_post, Sigma_post)
+        J_inv = np.linalg.inv(precisions.sum(0)) / self.kappa0
+        h = self.kappa0 * np.einsum('kij,kj->i', precisions, self.mu)
+        J_inv_h = J_inv @ h
+        self.mu0 = np.random.multivariate_normal(J_inv_h, J_inv)
 
     def sample_kappa0(self, precisions):
         num_clusters = self.N.shape[0]
@@ -1184,21 +1258,46 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         beta_post = 0.5 * np.einsum('kij,ki,kj->', Js, diffs, diffs)
         self.kappa0 = np.random.gamma(alpha_post, 1./beta_post)
 
-    def update_meanN(self):
+    def update_cluster_stats(self):
+        """Update the cluster statistics for calculating prior/post predictive.
+        """
+        K = self.N.shape[0]
+        nu_post = self.nu0 + self.N
         kappa_post = self.kappa0 + self.N
-        self.meanN = (self.kappa0 * self.mu0 + self.sumx) / kappa_post[:, None]
+        mu_post =  (self.kappa0 * self.mu0 + self.sumx) / kappa_post[:, None]
+        self.meanN = mu_post
+        Sigma_post = self.Sigma0 + self.kappa0 * np.outer(self.mu0, self.mu0)
+        Sigma_post = Sigma_post[np.newaxis, :, :] + self.sumxx
+        Sigma_post -= kappa_post[:, None, None] * np.einsum('ki,kj->kij', mu_post, mu_post)
+        # FIXME: Is there a better way to do this?
+        Sigma_post += 1e-4 * np.eye(self.dim)
+        self._chol = compute_cov_cholesky(Sigma_post,
+                                          covariance_type=self.covariance_type)
 
     def gibbs(self):
         self.sample_cluster_params()
+        # BUG! Need to use Sigmak estimates not Sigma posts!!!
+        # inv_chol = np.array([
+        #     scipy.linalg.solve_triangular(L, np.eye(self.dim), lower=True)
+        #     for L in self._chol])
+        # precisions = np.einsum('ijk,ijl->ikl', inv_chol, inv_chol)
+        # Slow:
+        # precisions = np.linalg.inv(self.Sigmak)
+        Sigmak_chol = compute_cov_cholesky(self.Sigmak,
+            covariance_type=self.covariance_type)
         inv_chol = np.array([
             scipy.linalg.solve_triangular(L, np.eye(self.dim), lower=True)
-            for L in self._chol])
+            for L in Sigmak_chol])
         precisions = np.einsum('ijk,ijl->ikl', inv_chol, inv_chol)
         self.sample_Sigma0(precisions)
-        self.sample_mh_nu0()
+        # Calculate log determinants for nu0 update
+        logdet_Sigmak = 2 * np.log(np.diagonal(
+            Sigmak_chol, axis1=1, axis2=2)).sum(-1)
+        logdet_Sigma0 = 2 * np.log(np.diagonal(self._priorchol)).sum()
+        self.sample_mh_nu0(logdet_Sigma0, logdet_Sigmak)
         self.sample_mu0(precisions)
         self.sample_kappa0(precisions)
-        self.update_meanN()
+        self.update_cluster_stats()
 
 
 class DiagDPGMMPostprocessor(DPGMM):

@@ -7,5 +7,5 @@ postprocessor:
     sigma0_scale: 1.
     sigma0_sample_cov: False
     kappa0: 1.
-    use_pca: False
+    use_pca: True
     pca_dim: 128

@@ -540,7 +540,7 @@ class GibbsEvaluator(Evaluator):
             self._extract_ood(ood_split='far', progress=progress)
 
             # Draw new Gibbs sample and calculate ood scores
-            # params = [copy.deepcopy(self.postprocessor.params)]
+            origparams = [copy.deepcopy(self.postprocessor.params)]
             for i in trange(self.num_gibbs_samples,
                     desc=f'Gather OOD Metrics for Gibbs Sample',
                     position=0,

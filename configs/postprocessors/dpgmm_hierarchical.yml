@@ -2,7 +2,7 @@ postprocessor:
   name: dpgmm_hierarchical
   APS_mode: False
   postprocessor_args:
-    alpha: 1.
+    alpha: 1e-200
     max_cls_conf: False
     sigma0_scale: 1.
     sigma0_sample_cov: True
