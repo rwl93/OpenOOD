@@ -9,3 +9,7 @@ postprocessor:
     kappa0: 1
     use_pca: False
     pca_dim: 128
+    nu0_fixed: False
+    nu0: 1000
+    gibbs_warmup: False
+    gibbs_warmup_iters: 100

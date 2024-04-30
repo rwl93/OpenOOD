@@ -812,6 +812,19 @@ class DPGMM(BasePostprocessor):
         if not hasattr(self, '_chol'):
             raise AttributeError("Must run setup before accessing chol")
         return self._chol
+    def gibbs_warmup(self, iters: int, fname: str = 'gibbs_warmup.pkl'):
+        if not hasattr(self, 'gibbs'):
+            return
+        logjoint = np.array([self.logjoint()]) # type: ignore
+        print(f'Gibbs Warmup Starting Log Joint: {logjoint[-1]}')
+        for itr in range(iters):
+            # Calculate log joint likelihood
+            # Gibbs step
+            self.gibbs() # type: ignore
+            logjoint = np.append(logjoint, self.logjoint(), axis=0) # type: ignore
+            print(f'Gibbs Warmup Iter {itr} Log Joint: {logjoint[-1]}')
+        # FIXME: Should I save out params every iteration?
+        np.save(fname, logjoint)
 
 
 class TiedDPGMMPostprocessor(DPGMM):
@@ -1080,7 +1093,12 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         self._params.update({"Sigma0": None, "kappa0": None, "nu0": None,
             "mu": None, "Sigmak": None})
         self.num_mh_steps = 20
-        self.nu0_prop_scale = 0.1
+        self.nu0_prop_scale = 10
+        self.nu0_fixed = self.args.nu0_fixed
+        if self.nu0_fixed:
+            self.nu0 = float(self.args.nu0)
+        self.gibbs_warmup = self.args.gibbs_warmup
+        self.gibbs_warmup_iters = self.args.gibbs_warmup_iters
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
@@ -1138,47 +1156,50 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
             print(f'kappa0: {self.kappa0}')
             # nu0: MLE of IW (Sigma_k | nu0, Sigma0)
             # Output plot data of Loglikelihood vs MLE nu0
-            # MLE Sigma0 @ nu0 = inverse((1 / nu0) * mean(cluster precision))
-            print("Running MLE for nu0 and Sigma0 estimates")
-            Jbar_inv = Js_sum_inv * K
-            def calc_loglik(nu):
-                return -scipy.stats.invwishart.logpdf(
-                    self.Sigmak.transpose(1,2,0),
-                    df=nu, scale=nu * Jbar_inv).sum()
-            nu0s = np.linspace(self.dim, 1500, 100)
-            logliks = []
-            for nu in tqdm(nu0s,
-                           desc='Calculate Loglikelihoods of IW(Sigma_k | nu, Sigma)',
-                           position=0,
-                           leave=False,
-                          ):
-                logliks.append(calc_loglik(nu))
-            fname = 'DPGMMHierarchical-nu0-Sigma0-likelihoods.pkl'
-            fname = os.path.join(os.getcwd(), fname)
-            if os.path.isfile(fname):
-                print(f'Moving old files to backup: {fname+".bkp"}')
-                os.rename(fname, fname+'.bkp')
-            torch.save({
-                'nu0': nu0s,
-                'loglik': logliks,
-            }, fname)
-            res = scipy.optimize.minimize_scalar(calc_loglik,
-                bounds=(float(self.dim), 1200.))
-            self.nu0 = res.x
-            print(f'nu0 optimization result: {res}')
+            if not self.nu0_fixed:
+                # MLE Sigma0 @ nu0 = inverse((1 / nu0) * mean(cluster precision))
+                print("Running MLE for nu0 and Sigma0 estimates")
+                Jbar_inv = Js_sum_inv * K
+                def calc_loglik(nu):
+                    return -scipy.stats.invwishart.logpdf(
+                        self.Sigmak.transpose(1,2,0),
+                        df=nu, scale=nu * Jbar_inv).sum()
+                nu0s = np.linspace(self.dim, 1500, 100)
+                logliks = []
+                for nu in tqdm(nu0s,
+                               desc='Calculate Loglikelihoods of IW(Sigma_k | nu, Sigma)',
+                               position=0,
+                               leave=False,
+                              ):
+                    logliks.append(calc_loglik(nu))
+                fname = 'DPGMMHierarchical-nu0-Sigma0-likelihoods.pkl'
+                fname = os.path.join(os.getcwd(), fname)
+                if os.path.isfile(fname):
+                    print(f'Moving old files to backup: {fname+".bkp"}')
+                    os.rename(fname, fname+'.bkp')
+                torch.save({
+                    'nu0': nu0s,
+                    'loglik': logliks,
+                }, fname)
+                res = scipy.optimize.minimize_scalar(calc_loglik,
+                    bounds=(float(self.dim), 1200.))
+                self.nu0 = res.x
+                print(f'nu0 optimization result: {res}')
 
             # STEP 3: Update prior/posterior predictive stats
             kappa_post = self.kappa0 + self.N
-            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappaN[:, None]
-            nu_post = self.nu0 + self.N
+            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappa_post[:, None]
             eps = 1e-5 * np.eye(self.dim)
             mu0outer = np.outer(self.mu0, self.mu0) + eps
             Sigma_post = self.Sigma0 + self.kappa0 * mu0outer
             Sigma_post = Sigma_post[None, :, :] + self.sumxx
-            Sigma_post -= kappaN[:, None, None] * np.einsum(
+            Sigma_post -= kappa_post[:, None, None] * np.einsum(
                 'ki,kj->kij', self.mu, self.mu)
             Sigma_post += 1e-4 * np.eye(self.dim)
             self._chol = compute_cov_cholesky(Sigma_post, self.covariance_type)
+            # Perform
+            self.gibbs_warmup(self.gibbs_warmup_iters,
+                              fname='hierarchical_gibbs_warmup.pkl')
             self.setup_flag = True
         else:
             pass
@@ -1219,6 +1240,8 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
 
     def sample_mh_nu0(self, logdet_Sigma0, logdet_Sigmak):
+        if self.nu0_fixed:
+            return
         num_clusters = self.N.shape[0]
         # logdet_Sigma0 = 2 * np.log(np.diagonal(self._priorchol)).sum()
         # BUG! Must use Sigmak samples NOT Sigma post
@@ -1276,11 +1299,6 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
 
     def gibbs(self):
         self.sample_cluster_params()
-        # BUG! Need to use Sigmak estimates not Sigma posts!!!
-        # inv_chol = np.array([
-        #     scipy.linalg.solve_triangular(L, np.eye(self.dim), lower=True)
-        #     for L in self._chol])
-        # precisions = np.einsum('ijk,ijl->ikl', inv_chol, inv_chol)
         # Slow:
         # precisions = np.linalg.inv(self.Sigmak)
         Sigmak_chol = compute_cov_cholesky(self.Sigmak,
@@ -1298,6 +1316,42 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         self.sample_mu0(precisions)
         self.sample_kappa0(precisions)
         self.update_cluster_stats()
+
+    def logjoint(self) -> float:
+        """Compute the log joint probability of the data, latent variables, and params.
+        """
+        lp = 0.0
+
+        K = self.N.shape[0]
+        # Compute the prior probability of the cluster params
+        lp += scipy.stats.invwishart.logpdf(
+            self.Sigmak.transpose(1,2,0), df=self.nu0, scale=self.Sigma0).sum()
+        for k in range(K):
+            lp += scipy.stats.multivariate_normal.logpdf(
+                self.mu[k],
+                mean=self.mu0, cov=(1. / self.kappa0) * self.Sigmak[k])
+
+        # Compute probability of cluster assignments
+        # NOTE: Not updating probs. Just using urn coeffs
+        # lp += Dirichlet(self.alpha / self.max_clusters * torch.ones(self.max_clusters)).log_prob(probs)
+        probs = self.urn_coeff()
+        lp += scipy.stats.dirichlet.logpdf(
+            probs[:-1], (self.alpha / K) * np.ones((K,)))
+        # uniq, cnts = np.unique(clusters, return_counts=True)
+        # cluster_counts = np.zeros((self.N.shape[0],))
+        # cluster_counts[uniq] = cnts
+        lp += (np.log(probs[:-1]) * self.N).sum()
+        # Compute likelihood for the data
+        lls = - (0.5 * self.N.sum() * self.dim) * np.log(2. * np.pi)
+        lls -= 0.5 * (self.N * np.linalg.slogdet(self.Sigmak)[1]).sum()
+        sumsqdevs = self.sumxx - np.einsum('ki,kj->kij', self.sumx, self.mu) \
+            - np.einsum('ki,kj->kij', self.mu, self.sumx) \
+            + self.N[:, None, None] * np.einsum('ki,kj->kij', self.mu, self.mu)
+        lls -= 0.5 * np.trace(
+            np.einsum('kij,kjl->kil', sumsqdevs, np.linalg.inv(self.Sigmak)),
+            axis1=-2, axis2=-1).sum()
+        lp += lls
+        return lp
 
 
 class DiagDPGMMPostprocessor(DPGMM):
