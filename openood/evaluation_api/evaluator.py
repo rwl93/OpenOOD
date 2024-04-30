@@ -565,7 +565,8 @@ class GibbsEvaluator(Evaluator):
                                               gibbs_sample=i)
                 far_metrics = self._eval_ood([id_pred, id_conf, id_gt],
                                              ood_split='far',
-                                             progress=progress)
+                                             progress=progress,
+                                             gibbs_sample=i)
                 self.param_metrics[f'{id_name}_acc'].append(near_metrics[0,-1])
                 # if self.metrics[f'{id_name}_acc'] is None:
                 #     self.metrics[f'{id_name}_acc'] = near_metrics[0,-1]

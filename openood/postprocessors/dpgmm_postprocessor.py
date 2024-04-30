@@ -744,7 +744,8 @@ class DPGMM(BasePostprocessor):
 
     def set_priors(self, all_feats):
         # Setup priors
-        self.nu0 = self.dim + 1
+        if not hasattr(self, 'nu0'):
+            self.nu0 = self.dim + 1
         self.mu0 = all_feats.mean(0)
         self.epsilon = self.dim + 0.001
         self.kappa = 0.001
@@ -812,18 +813,24 @@ class DPGMM(BasePostprocessor):
         if not hasattr(self, '_chol'):
             raise AttributeError("Must run setup before accessing chol")
         return self._chol
+
     def gibbs_warmup(self, iters: int, fname: str = 'gibbs_warmup.pkl'):
+        if not self.use_gibbs_warmup:
+            return
         if not hasattr(self, 'gibbs'):
             return
         logjoint = np.array([self.logjoint()]) # type: ignore
         print(f'Gibbs Warmup Starting Log Joint: {logjoint[-1]}')
-        for itr in range(iters):
-            # Calculate log joint likelihood
-            # Gibbs step
+        for itr in  trange(iters,
+                           desc="Gibbs Warmup",
+                           position=0,
+                           #leave=False,
+                           colour='green',
+                           ):
             self.gibbs() # type: ignore
-            logjoint = np.append(logjoint, self.logjoint(), axis=0) # type: ignore
+            logjoint = np.append(logjoint, [self.logjoint()], axis=0) # type: ignore
             print(f'Gibbs Warmup Iter {itr} Log Joint: {logjoint[-1]}')
-        # FIXME: Should I save out params every iteration?
+            # FIXME: Should I save out params every iteration?
         np.save(fname, logjoint)
 
 
@@ -1097,7 +1104,7 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         self.nu0_fixed = self.args.nu0_fixed
         if self.nu0_fixed:
             self.nu0 = float(self.args.nu0)
-        self.gibbs_warmup = self.args.gibbs_warmup
+        self.use_gibbs_warmup = self.args.gibbs_warmup
         self.gibbs_warmup_iters = self.args.gibbs_warmup_iters
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
@@ -1186,6 +1193,7 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
                 self.nu0 = res.x
                 print(f'nu0 optimization result: {res}')
 
+            print(f'nu0: {self.nu0}')
             # STEP 3: Update prior/posterior predictive stats
             kappa_post = self.kappa0 + self.N
             self.meanN = (self.kappa0 * self.mu0 + sumx) / kappa_post[:, None]
