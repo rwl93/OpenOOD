@@ -1251,12 +1251,6 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         if self.nu0_fixed:
             return
         num_clusters = self.N.shape[0]
-        # logdet_Sigma0 = 2 * np.log(np.diagonal(self._priorchol)).sum()
-        # BUG! Must use Sigmak samples NOT Sigma post
-        # logdet_Sigmak = 2 * np.log(np.diagonal(self._chol, axis1=1, axis2=2)).sum(-1)
-        # FIXME: TODO: Move this to gibbs method and calculate precisions and logdet
-        # from the cholesky to avoid duplicate computation
-        # logdet_Sigmak = np.linalg.det(self.Sigmak)
 
         def _target(nu0):
             if nu0 <= 0.0: return - np.inf
@@ -1391,6 +1385,274 @@ class DiagDPGMMPostprocessor(DPGMM):
             self.setup_flag = True
         else:
             pass
+
+
+class DiagHierarchicalDPGMMPostprocessor(DPGMM):
+    def __init__(self, config):
+        super().__init__(config)
+        self.covariance_type = 'diag'
+        # NOTE: mu and Sigmak are used as solely for updating the hyperprior
+        # quantities. They are not used in log prior or posterior predictive
+        # calculations because they are integrated over.
+        self._params.update({"Sigma0": None, "kappa0": None, "nu0": None,
+            "mu": None, "Sigmak": None})
+        self.num_mh_steps = 20
+        self.nu0_prop_scale = 10
+        self.nu0_fixed = self.args.nu0_fixed
+        self.use_gibbs_warmup = self.args.gibbs_warmup
+        self.gibbs_warmup_iters = self.args.gibbs_warmup_iters
+
+    def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
+        if not self.setup_flag:
+            print('\nEstimating cluster statistics from training set...')
+            print(f'alpha: {self.alpha}')
+            sumx, sumxx, sample_means = self.initial_setup(net, id_loader_dict['train'])
+            self.sumx = sumx
+            self.sumxx = sumxx
+            self.sample_means = sample_means
+            if self.nu0_fixed:
+                self.nu0 = float(self.args.nu0) * np.ones((self.dim))
+
+            # STEP 1: Estimate class-wise means and covs from sample stats and
+            # uninformative priors as their respective means
+            kappa_post = self.N[:, None] + self.kappa0 # (K,D)
+            nu_post = self.N[:, None] + self.nu0 # (K,D)
+            self.mu = (self.kappa0 * self.mu0 + sumx) / kappa_post # (K,D)
+            # ((D) * (D) + (D) * (D)**2 + (K,D) - (K,D) * (K,D)**2) / (K,D) -> (K,D)
+            Sigma_post = self.nu0 * self.Sigma0 + self.kappa0 * (self.mu0 ** 2) # (D)
+            Sigma_post = Sigma_post + self.sumxx - kappa_post * (self.mu ** 2) # (K,D)
+            Sigma_post /= nu_post # (K,D)
+
+            self.Sigmak = (nu_post * Sigma_post) / (nu_post - 2) # (K,D)
+
+            # STEP 2: Update priors: Sigma0/_priorchol, mu0, kappa0, nu0 as
+            # their respective means and the MLE for nu0
+            K = self.N.shape[0]
+            Js = 1. / self.Sigmak
+            Js_sum = Js.sum(0)
+            Js_sum_inv = 1. / Js_sum
+            df = K * self.nu0 + 2 # (D,)
+            print(f'Sigma0 chi-sq df = {df}')
+            scale = (df / self.nu0) * Js_sum_inv # (D,)
+            alpha = df / 2.
+            beta = df / (2. * scale)
+            self.Sigma0 = alpha / beta
+            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+
+            # mu0 := mean(N(inv(J)h, inv(J))) = inv(J)h
+            # J := kappa0 * sum_k(prec_k)
+            # h := kappa0 * sum_k(prec_k @ mu_k)
+            J_inv_mu0 = Js_sum_inv / self.kappa0 # (D,)
+            h_mu0 = self.kappa0 * (self.mu / Js).sum(0)
+            self.mu0 = J_inv_mu0 * h_mu0
+            # kappa0
+            alpha = K * 0.5 + 1.
+            diffs = self.mu - self.mu0
+            beta = 0.5 * ((diffs ** 2) / self.Sigmak).sum(0)
+            self.kappa0 = alpha / beta
+            print(f'kappa0: {self.kappa0}')
+            # nu0: MLE of IW (Sigma_k | nu0, Sigma0)
+            # Output plot data of Loglikelihood vs MLE nu0
+            if not self.nu0_fixed:
+                # MLE Sigma0 @ nu0 = inverse((1 / nu0) * mean(cluster precision))
+                print("Running MLE for nu0 and Sigma0 estimates")
+                Jbar_inv = Js_sum_inv * K
+                def calc_loglik(nu):
+                    alpha = nu / 2
+                    beta = (Jbar_inv * nu) / 2.
+                    return -scipy.stats.invgamma(alpha, scale=1/beta).logpdf(
+                            self.Sigmak).sum()
+                nu0s = np.linspace(1, 1500, 1000)
+                logliks = []
+                for nu in tqdm(nu0s,
+                               desc='Calculate Loglikelihoods of IX(Sigma_k | nu, Sigma)',
+                               position=0,
+                               leave=False,
+                              ):
+                    logliks.append(calc_loglik(nu))
+                fname = 'DPGMMDiagHierarchical-nu0-Sigma0-likelihoods.pkl'
+                fname = os.path.join(os.getcwd(), fname)
+                if os.path.isfile(fname):
+                    print(f'Moving old files to backup: {fname+".bkp"}')
+                    os.rename(fname, fname+'.bkp')
+                torch.save({
+                    'nu0': nu0s,
+                    'loglik': logliks,
+                }, fname)
+                res = scipy.optimize.minimize_scalar(calc_loglik, bounds=(1., 1200.))
+                self.nu0 = res.x
+                print(f'nu0 optimization result: {res}')
+
+            print(f'nu0: {self.nu0}')
+            # STEP 3: Update prior/posterior predictive stats
+            kappa_post = self.N[:, None] + self.kappa0
+            self.meanN = (self.kappa0 * self.mu0 + sumx) / kappa_post
+            # ((D) * (D) + (D) * (D)**2 + (K,D) - (K,D) * (K,D)**2) / (K,D) -> (K,D)
+            Sigma_post = self.nu0 * self.Sigma0 + self.kappa0 * (self.mu0 ** 2) # (D)
+            Sigma_post = Sigma_post + self.sumxx - kappa_post * (self.meanN ** 2) # (K,D)
+            Sigma_post /= nu_post # (K,D)
+            self._chol = compute_cov_cholesky(Sigma_post, self.covariance_type)
+            # Perform
+            self.gibbs_warmup(self.gibbs_warmup_iters,
+                              fname='diag_hierarchical_gibbs_warmup')
+            self.setup_flag = True
+        else:
+            pass
+
+    def sample_cluster_params(self):
+        """Sample mu and Sigma for each class
+
+        Note
+        ----
+        We need to do this despite it being integrated out in the
+        posterior predictive because the other Gibbs samplers use this
+        quantity.
+        """
+        # NOTE: This mu_k is a sample from the normal dist. The meanN used for
+        # calculating the posterior predictive is the mean of this normal dist.
+        nu_post = self.N[:, None] + self.nu0 # (K,0) + (D,) -> (K,D)
+        kappa_post = self.N[:, None] + self.nu0 # (K,0) + (D,) -> (K,D)
+        # ((D,) * (D,) + (K,D) ) / (K,D) -> (K,D)
+        mu_post =  (self.kappa0 * self.mu0 + self.sumx) / kappa_post
+        # ((D) * (D) + (D) * (D)**2 + (K,D) - (K,D) * (K,D)**2) / (K,D) -> (K,D)
+        Sigma_post = self.nu0 * self.Sigma0 + self.kappa0 * (self.mu0 ** 2) # (D)
+        Sigma_post = Sigma_post + self.sumxx - kappa_post * (mu_post ** 2) # (K,D)
+        Sigma_post /= nu_post # (K,D)
+
+        alpha = nu_post / 2. # (K,D)
+        beta = (nu_post * Sigma_post) / 2. # (K,D)
+        self.Sigmak = scipy.stats.invgamma(alpha, scale=beta).rvs() # (K,D)
+        self.mu = scipy.stats.norm(loc=mu_post, scale=self.Sigmak / kappa_post).rvs() # (K,D)
+
+    def sample_Sigma0(self):
+        df = self.N.shape[0] * self.nu0 + 2 # (D,)
+        # Calculate sum of covs
+        sum_prec = (1. / self.Sigmak).sum(0) # (D,)
+        scale = (df / self.nu0) * (1. / sum_prec) # (D,)
+        alpha = df / 2.
+        beta = df / (2. * scale)
+        self.Sigma0 = scipy.stats.gamma(alpha, scale=1./beta).rvs()
+        self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+
+    def sample_mh_nu0(self):
+        if self.nu0_fixed:
+            return
+        num_clusters = self.N.shape[0]
+        def _target(nu0):
+            nu0 = np.copy(nu0) # avoid side effects
+            invalid_idxs = nu0 <= 0.0
+            nu0[invalid_idxs] = 1
+            lp = 0.5 * num_clusters * nu0 * np.log(0.5 * nu0)
+            lp -= num_clusters * scipy.special.loggamma(0.5 * nu0)
+            div = self.Sigma0 / self.Sigmak
+            lp -= 0.5 * nu0 * div.sum(0)
+            lp += 0.5 * nu0 * np.log(div).sum(0)
+            lp[invalid_idxs] = - np.inf
+            return lp
+
+        nu0 = self.nu0
+        curr_lp = _target(nu0)
+        for _ in range(self.num_mh_steps):
+            prop_nu0 = np.random.normal(loc=nu0, scale=self.nu0_prop_scale) # (D)
+            prop_lp = _target(prop_nu0)
+            thresh = np.log(np.random.uniform(self.dim))
+            accept = prop_lp - curr_lp >= thresh
+            nu0[accept] = prop_nu0[accept]
+            curr_lp[accept] = prop_lp[accept]
+        self.nu0 = nu0
+
+    def sample_mu0(self):
+        J = self.kappa0 * (1. / self.Sigmak).sum(0) # (D)
+        J_inv = 1. / J
+        h = self.kappa0 * (self.mu / self.Sigmak).sum(0) # (D)
+        J_inv_h = J_inv * h
+        self.mu0 = scipy.stats.norm(loc=J_inv_h, scale=J_inv).rvs() # (D)
+
+    def sample_kappa0(self):
+        num_clusters = self.N.shape[0]
+        alpha_post = num_clusters / 2. + 1.
+        beta_post = 0.5 * (((self.mu - self.mu0) ** 2) / self.Sigmak).sum(0)
+        self.kappa0 = np.random.gamma(alpha_post, 1./beta_post)
+
+    def update_cluster_stats(self):
+        """Update the cluster statistics for calculating prior/post predictive.
+        """
+        K = self.N.shape[0]
+        nu_post = self.N[:, None] + self.nu0 # (K,0) + (D,) -> (K,D)
+        kappa_post = self.N[:, None] + self.nu0 # (K,0) + (D,) -> (K,D)
+        # ((D,) * (D,) + (K,D) ) / (K,D) -> (K,D)
+        mu_post =  (self.kappa0 * self.mu0 + self.sumx) / kappa_post
+        self.meanN = mu_post
+        # ((D) * (D) + (D) * (D)**2 + (K,D) - (K,D) * (K,D)**2) / (K,D) -> (K,D)
+        Sigma_post = self.nu0 * self.Sigma0 + self.kappa0 * (self.mu0 ** 2) # (D)
+        Sigma_post = Sigma_post + self.sumxx - kappa_post * (mu_post ** 2) # (K,D)
+        Sigma_post /= nu_post # (K,D)
+        self._chol = compute_cov_cholesky(Sigma_post,
+                                          covariance_type=self.covariance_type)
+
+    def gibbs(self):
+        self.sample_cluster_params()
+        self.sample_Sigma0()
+        self.sample_mh_nu0()
+        self.sample_mu0()
+        self.sample_kappa0()
+        self.update_cluster_stats()
+
+    def logjoint(self) -> float:
+        """Compute the log joint probability of the data, latent variables, and params.
+        """
+        lp = 0.0
+
+        K = self.N.shape[0]
+        # Compute the prior probability of the cluster params
+        lp += scipy.stats.invgamma(
+            self.nu0 / 2, scale=(self.nu0 * self.Sigma0) / 2
+            ).logpdf(self.Sigmak).sum() # Sum over classes and dim
+        lp += scipy.stats.norm(
+            loc=self.mu0, scale=self.Sigmak /
+            self.kappa0).logpdf(self.mu).sum() # Sum over classes and dim
+        # Compute probability of cluster assignments
+        probs = self.urn_coeff()
+        lp += scipy.stats.dirichlet.logpdf(
+            probs[:-1], (self.alpha / K) * np.ones((K,)))
+        lp += (np.log(probs[:-1]) * self.N).sum()
+        # Compute likelihood for the data
+        lls = - 0.5 * self.N.sum() * self.dim * np.log(2. * np.pi)
+        lls -= 0.5 * (self.N[:, None] * np.log(self.Sigmak)).sum()
+        lls -= 0.5 * ((
+            self.sumxx - 2 * self.sumx * self.mu + self.N[:, None] * self.mu ** 2
+            ) / self.Sigmak).sum()
+        lp += lls
+        return lp
+
+    def logpostpred(self, x, use_torch=False):
+        # NOTE: Dimension first for broadcasting with multiple classes
+        # Params: D,K, Data: N,D,1, Output: N,D,K -> sum(1) -> N,K
+        nu_N = self.nu0[:, None] + self.N  # (D, K)
+        kappa_N = self.kappa0[:, None] + self.N  # (D, K)
+        factor = (kappa_N + 1) / kappa_N # (D, K)
+        st = factor * (self.chol.T ** 2) # (D, K)
+        meanN = self.meanN.T # (D, K)
+        if use_torch:
+            nu_N  = torch.tensor(nu_N, device=DEVICE)
+            meanN  = torch.tensor(meanN, device=DEVICE)
+            st = torch.tensor(st, device=DEVICE)
+            return torch.distributions.StudentT(
+                nu_N, loc=meanN, scale=st).log_prob(x).sum(1) # type: ignore
+        return scipy.stats.t(
+            nu_N, loc=meanN, scale=st).logpdf(x[..., None]).sum(1)
+
+    def logpriorpred(self, x, use_torch=False):
+        factor = (self.kappa0 + 1) / self.kappa0
+        st = factor * self.priorchol ** 2
+        if use_torch:
+            nu0  = torch.tensor(self.nu0, device=DEVICE)
+            mu0  = torch.tensor(self.mu0, device=DEVICE)
+            st = torch.tensor(st, device=DEVICE)
+            return torch.distributions.StudentT(
+                nu0, loc=mu0, scale=st).log_prob(x).sum(-1) # type: ignore
+        return scipy.stats.t(self.nu0, loc=self.mu0, scale=st).logpdf(x).sum(-1)
+
 
 
 class SphericalDPGMMPostprocessor(DPGMM):
