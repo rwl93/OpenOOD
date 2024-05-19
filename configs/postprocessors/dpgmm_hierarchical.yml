@@ -8,8 +8,12 @@ postprocessor:
     sigma0_sample_cov: True
     kappa0: 1
     use_pca: True
-    pca_dim: 256
-    nu0_fixed: True
-    nu0: 1000000
-    gibbs_warmup: True
-    gibbs_warmup_iters: 100
+    pca_dim: 64
+    nu0_fixed: False
+    nu0: 1e6
+    gibbs_warmup: False
+    gibbs_warmup_iters: 10
+    load_tied_covs: False
+    tied_params_fname: 'tied_pca256.npz'
+    use_likelihood: False
+    init_sample_covs: False

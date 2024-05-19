@@ -1,6 +1,7 @@
 import os
 from typing import Any
 from copy import deepcopy
+from multiprocessing import Pool
 
 import numpy as np
 import torch
@@ -264,7 +265,8 @@ def multivariate_normal_logpdf_full_torch(x, mean, scale_tril):
         # (N,K,D) - (K, D) = (N,K,D)
         #  (N,K,n)
         dev = x_NKD - mean
-        # (N,K,D)/(K,D,D) dev_KDN = dev.permute(1,2,0)
+        # (N,K,D)/(K,D,D)
+        dev_KDN = dev.permute(1,2,0)
         maha = torch.linalg.solve_triangular(scale_tril, dev_KDN,  upper=False)
         if maha.ndim == 3:
             maha = torch.square(maha).sum(1).T # (N,K)
@@ -600,6 +602,7 @@ class DPGMM(BasePostprocessor):
         self.use_pca = self.args.use_pca
         if self.use_pca:
             print(f'PCA Dimension: {self.args.pca_dim}')
+        self.use_likelihood = self.args.get('use_likelihood', False)
         self.pca_dim = self.args.pca_dim
         self.args_dict = self.config.postprocessor.postprocessor_sweep
         self._params = {"_chol": None, "_priorchol": None, "mu0": None, "meanN": None}
@@ -637,7 +640,10 @@ class DPGMM(BasePostprocessor):
             st = torch.tensor(st, device=DEVICE)
             return multivariate_t_logpdf_torch(
                 x, df, meanN, st, self.covariance_type)
+            # return multivariate_normal_logpdf_torch(
+            #       x, meanN, st, self.covariance_type)
         return multivariate_t_logpdf(x, df, self.meanN, st, self.covariance_type)
+        # return multivariate_normal_logpdf(x, self.meanN, st, self.covariance_type)
 
     def logpriorpred(self, x, use_torch=False):
         dim = x.shape[1]
@@ -658,7 +664,9 @@ class DPGMM(BasePostprocessor):
             mu0  = torch.tensor(self.mu0, device=DEVICE)
             st = torch.tensor(st, device=DEVICE)
             return multivariate_t_logpdf_torch(x, df, mu0, st, self.covariance_type)
+            # return multivariate_normal_logpdf_torch(x, mu0, st, self.covariance_type)
         return multivariate_t_logpdf(x, df, self.mu0, st, self.covariance_type)
+        # return multivariate_normal_logpdf(x, self.mu0, st, self.covariance_type)
 
     def urn_coeff(self):
         coeffs = np.concatenate((self.N, [self.alpha]), axis=0)
@@ -679,6 +687,16 @@ class DPGMM(BasePostprocessor):
             logpx_y = np.concatenate((logpost, logprior), axis=-1)
             logpy_x = logpx_y + np.log(py)
             py_x = scipy.special.log_softmax(logpy_x, axis=-1)
+        if self.use_likelihood:
+            # return logpx_y Worse than random!:
+            # Need an ID class to take some of the probability
+            # Try normalized likelihood:
+            # Attempt Simple: Divide by sum log pxy
+            if use_torch:
+                out = torch.log_softmax(logpx_y, -1)
+            else:
+                out = scipy.special.log_softmax(logpx_y, axis=-1)
+            return out
         return py_x
 
     @torch.no_grad()
@@ -737,7 +755,8 @@ class DPGMM(BasePostprocessor):
             torch.save({'feats': all_feats, 'labels': all_labels, 'preds': all_preds}, fname)
         all_feats = all_feats.numpy()
         if self.use_pca:
-            self.pca = PCA(n_components=self.pca_dim).fit(all_feats)
+            self.pca = PCA(
+                n_components=self.pca_dim, random_state=123).fit(all_feats)
             all_feats = self.pca.transform(all_feats)
         self.dim = all_feats.shape[1]
         return all_feats, all_labels
@@ -814,13 +833,42 @@ class DPGMM(BasePostprocessor):
             raise AttributeError("Must run setup before accessing chol")
         return self._chol
 
+    def cov_sumsqdiffmean(self):
+        if self.covariance_type in ['full', 'tied']:
+            Sigma_post = np.einsum('kij,klj->kil', self.chol, self.chol) 
+            if self.covariance_type == 'full':
+                kappa_post = self.kappa0 + self.N
+                df = self.nu0 + self.N - self.dim + 1
+                factor = (kappa_post + 1) / (kappa_post * df)
+                Sigma_post = factor[:, None, None] * Sigma_post
+            K = self.N.shape[0]
+            diffs = np.empty((0,))
+            for k in range(K-1):
+                diff = ((Sigma_post[k] - Sigma_post[k+1:]) ** 2).sum((-2, -1))
+                diffs = np.append(diffs, diff, 0)
+            assert (diffs.shape[0] == (K * (K-1)) / 2)
+        else:
+            Sigma_post = self.chol ** 2
+            kappa_post = self.N[:, None] + self.kappa0
+            factor = (kappa_post + 1) / kappa_post
+            Sigma_post = factor * Sigma_post
+            K = self.N.shape[0]
+            diffs = np.empty((0,))
+            for k in range(K-1):
+                diff = ((Sigma_post[k] - Sigma_post[k+1:]) ** 2).sum((-1))
+                diffs = np.append(diffs, diff, 0)
+        return diffs.mean()
+
     def gibbs_warmup(self, iters: int, fname: str = 'gibbs_warmup.pkl'):
         if not self.use_gibbs_warmup:
             return
         if not hasattr(self, 'gibbs'):
             return
         logjoint = np.array([self.logjoint()]) # type: ignore
-        print(f'Gibbs Warmup Starting Log Joint: {logjoint[-1]}')
+        sumsqdiffmean = np.array([self.cov_sumsqdiffmean()])
+        print(f'Gibbs Warmup Starting Log Joint: {logjoint[-1]} '
+              + f'Sum Sq Diff Mean of Covs: {sumsqdiffmean[-1]}'
+              )
         for itr in  trange(iters,
                            desc="Gibbs Warmup",
                            position=0,
@@ -829,9 +877,13 @@ class DPGMM(BasePostprocessor):
                            ):
             self.gibbs() # type: ignore
             logjoint = np.append(logjoint, [self.logjoint()], axis=0) # type: ignore
-            print(f'Gibbs Warmup Iter {itr} Log Joint: {logjoint[-1]}')
+            sumsqdiffmean = np.append(sumsqdiffmean, [self.cov_sumsqdiffmean()], 0) # type: ignore
+            print(f'Gibbs Warmup Iter {itr} '
+                  + f'Log Joint: {logjoint[-1]}'
+                  + f'Sum Sq Diff Mean of Covs: {sumsqdiffmean[-1]}'
+                  )
             # FIXME: Should I save out params every iteration?
-        np.save(fname, logjoint)
+        np.savez(fname, logjoint=logjoint, sumsqdiffmean=sumsqdiffmean)
 
 
 class TiedDPGMMPostprocessor(DPGMM):
@@ -1106,6 +1158,9 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
             self.nu0 = float(self.args.nu0)
         self.use_gibbs_warmup = self.args.gibbs_warmup
         self.gibbs_warmup_iters = self.args.gibbs_warmup_iters
+        self.load_tied_covs = self.args.load_tied_covs
+        self.tied_params_fname = self.args.tied_params_fname
+        self.init_sample_covs = self.args.get('init_sample_covs', False)
 
     def setup(self, net: nn.Module, id_loader_dict, ood_loader_dict):
         if not self.setup_flag:
@@ -1119,48 +1174,54 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
 
             # STEP 1: Estimate class-wise means and covs from sample stats and
             # uninformative priors as their respective means
-            kappaN = self.kappa0 + self.N
-            self.mu = (self.kappa0 * self.mu0 + sumx) / kappaN[:, None]
-            nuN = self.nu0 + self.N
-            eps = 1e-5 * np.eye(self.dim)
-            mu0outer = np.outer(self.mu0, self.mu0) + eps
-            Sigma_post = self.Sigma0 + self.kappa0 * mu0outer
-            Sigma_post = Sigma_post[None, :, :] + self.sumxx
-            Sigma_post -= kappaN[:, None, None] * np.einsum(
-                'ki,kj->kij', self.mu, self.mu)
-            # FIXME: Is there a better way to do this?
-            Sigma_post += 1e-4 * np.eye(self.dim)
-            if (nuN <= self.dim + 1.).any():
-                raise ValueError("Invalid nuN value. Must be > dim + 1")
-            self.Sigmak = Sigma_post / (nuN - self.dim - 1.)[:, None, None]
+            # kappaN = self.kappa0 + self.N
+            # self.mu = (self.kappa0 * self.mu0 + sumx) / kappaN[:, None]
+            # nuN = self.nu0 + self.N
+            # eps = 1e-5 * np.eye(self.dim)
+            # mu0outer = np.outer(self.mu0, self.mu0) + eps
+            # XXX: Don't set Sigmak from Sigma_post since it is affected by nu0
+            # Sigma_post = self.Sigma0 + self.kappa0 * mu0outer
+            # Sigma_post = Sigma_post[None, :, :] + self.sumxx
+            # Sigma_post -= kappaN[:, None, None] * np.einsum(
+            #     'ki,kj->kij', self.mu, self.mu)
+            # Sigma_post += 1e-4 * np.eye(self.dim)
+            # if (nuN <= self.dim + 1.).any():
+            #     raise ValueError("Invalid nuN value. Must be > dim + 1")
+            # self.Sigmak = Sigma_post / (nuN - self.dim - 1.)[:, None, None]
+            # Set Sigmak and mu to sample means and covs
+            np.testing.assert_allclose(sumx / self.N[:, None], sample_means)
+            self.mu = np.array(sample_means)
+            self.Sigmak = (
+                sumxx - np.einsum('ki,kj->kij', sumx, sumx)
+                / self.N[:, None, None]) / (self.N - 1)[:, None, None]
 
             # STEP 2: Update priors: Sigma0/_priorchol, mu0, kappa0, nu0 as
             # their respective means and the MLE for nu0
-            # Sigma0 := mean( W(K*nu0 + D + 1, inv(sum(prec_k)) ) )
-            #         = (K*nu0 + D + 1) * inv(sum(prec_k))
+            # NOTE: Order of operations matters here:
+            # Currently we have good estimates for mu, mu0 and Sigmak
+            # 1. kappa0 depends on mu, mu0, Sigmak
+            # 2. mu0 depends on kappa0, mu, Sigmak
+            # 3. nu0 depends on Sigmak
+            # 4. Sigma0 depends on nu0, Sigmak
             K = self.N.shape[0]
             Js = np.linalg.inv(self.Sigmak)
             Js_sum = Js.sum(0)
             Js_sum_inv = np.linalg.inv(Js_sum)
-            factor = K * self.nu0 + self.dim + 1.
-            # NOTE: This factor is going to be very large:
-            # 1000 * 768 + 768 + 1 = 768769
-            print(f'Sigma0 Wishart df = {factor}')
-            self.Sigma0 = factor * Js_sum_inv
-            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+            # kappa0 := mean(Ga(DK/2 + 1, 1/2 sum((muk-mu0)^T inv(Sigmak) (muk-mu0)) ) )
+            #         = (DK/2 + 1) /  (1/2 sum((muk-mu0)^T inv(Sigmak) (muk-mu0)))
+            # NOTE: self.mu0 = all_feats.mean(0)
+            #                = (sumx * self.N[:, None]).sum(0) / N.sum()
+            alpha = (self.dim * K * 0.5) + 1.
+            diffs = self.mu - self.mu0
+            beta = 0.5 * np.einsum('kij,ki,kj->', Js, diffs, diffs)
+            self.kappa0 = alpha / beta
+            print(f'kappa0: {self.kappa0}')
             # mu0 := mean(N(inv(J)h, inv(J))) = inv(J)h
             # J := kappa0 * sum_k(prec_k)
             # h := kappa0 * sum_k(prec_k @ mu_k)
             J_inv_mu0 = Js_sum_inv / self.kappa0 # (D,D)
             h_mu0 = self.kappa0 * np.einsum('kij,kj->i', Js, self.mu) # (D,)
             self.mu0 = J_inv_mu0 @ h_mu0
-            # kappa0 := mean(Ga(DK/2 + 1, 1/2 sum((muk-mu0)^T inv(Sigmak) (muk-mu0)) ) )
-            #         = (DK/2 + 1) /  (1/2 sum((muk-mu0)^T inv(Sigmak) (muk-mu0)))
-            alpha = (self.dim * K * 0.5) + 1.
-            diffs = self.mu - self.mu0
-            beta = 0.5 * np.einsum('kij,ki,kj->', Js, diffs, diffs)
-            self.kappa0 = alpha / beta
-            print(f'kappa0: {self.kappa0}')
             # nu0: MLE of IW (Sigma_k | nu0, Sigma0)
             # Output plot data of Loglikelihood vs MLE nu0
             if not self.nu0_fixed:
@@ -1192,22 +1253,70 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
                     bounds=(float(self.dim), 1200.))
                 self.nu0 = res.x
                 print(f'nu0 optimization result: {res}')
-
             print(f'nu0: {self.nu0}')
+            # Sigma0 := mean( W(K*nu0 + D + 1, inv(sum(prec_k)) ) )
+            #         = (K*nu0 + D + 1) * inv(sum(prec_k))
+            factor = K * self.nu0 + self.dim + 1.
+            print(f'Sigma0 Wishart df = {factor}')
+            self.Sigma0 = factor * Js_sum_inv
+            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
             # STEP 3: Update prior/posterior predictive stats
             kappa_post = self.kappa0 + self.N
             self.meanN = (self.kappa0 * self.mu0 + sumx) / kappa_post[:, None]
             eps = 1e-5 * np.eye(self.dim)
             mu0outer = np.outer(self.mu0, self.mu0) + eps
             Sigma_post = self.Sigma0 + self.kappa0 * mu0outer
-            Sigma_post = Sigma_post[None, :, :] + self.sumxx
+            Sigma_post = Sigma_post[None, :, :] + sumxx
             Sigma_post -= kappa_post[:, None, None] * np.einsum(
-                'ki,kj->kij', self.mu, self.mu)
+                'ki,kj->kij', self.meanN, self.meanN)
+                # 'ki,kj->kij', self.mu, self.mu)
             Sigma_post += 1e-4 * np.eye(self.dim)
             self._chol = compute_cov_cholesky(Sigma_post, self.covariance_type)
-            # Perform
+
+            # Overwrite Sigma0 and Sigmak
+            if self.load_tied_covs:
+                print("Loading Sigmas and Sigma0 from tied params:")
+                print(self.tied_params_fname)
+                with np.load(self.tied_params_fname) as tied_data:
+                    self.mu0 = tied_data['mu0']
+                    self.meanN = tied_data['mu_post']
+                    self.Sigmak = tied_data['Sigma_post']
+                    self.Sigma0 = tied_data['Sigma0']
+                    kappaN = self.kappa0 + self.N
+                    df = self.nu0 + self.N - self.dim + 1
+                    factor = (kappaN + 1) / (kappaN * df)
+                    self._chol = compute_cov_cholesky(
+                        self.Sigmak / factor[:, None, None],
+                        self.covariance_type)
+                    df = self.nu0 - self.dim + 1
+                    factor = (self.kappa0 + 1) / (self.kappa0 * df)
+                    self._priorchol = compute_cov_cholesky(
+                        self.Sigma0 / factor,
+                        self.covariance_type)
+            elif self.init_sample_covs:
+                print("Setting Sigmas and Sigma0 w/ sample stats")
+                self.meanN = self.sumx / self.N[:, None]
+                self.mu0 = (self.meanN).mean(0)
+                self.Sigmak = (
+                    self.sumxx
+                    - np.einsum('ki,kj->kij', self.sumx, self.sumx)
+                    / self.N[:, None, None]
+                    ) / (self.N-1)[:, None, None]
+                self.Sigma0 = self.Sigmak.mean(0)
+                kappaN = self.kappa0 + self.N
+                df = self.nu0 + self.N - self.dim + 1
+                factor = (kappaN + 1) / (kappaN * df)
+                self._chol = compute_cov_cholesky(
+                    self.Sigmak / factor[:, None, None],
+                    self.covariance_type)
+                df = self.nu0 - self.dim + 1
+                factor = (self.kappa0 + 1) / (self.kappa0 * df)
+                self._priorchol = compute_cov_cholesky(
+                    self.Sigma0 / factor,
+                    self.covariance_type)
+            # Perform Gibbs Warmup
             self.gibbs_warmup(self.gibbs_warmup_iters,
-                              fname='hierarchical_gibbs_warmup.pkl')
+                              fname='hierarchical_gibbs_warmup')
             self.setup_flag = True
         else:
             pass
@@ -1292,9 +1401,9 @@ class HierarchicalDPGMMPostprocessor(DPGMM):
         mu_post =  (self.kappa0 * self.mu0 + self.sumx) / kappa_post[:, None]
         self.meanN = mu_post
         Sigma_post = self.Sigma0 + self.kappa0 * np.outer(self.mu0, self.mu0)
-        Sigma_post = Sigma_post[np.newaxis, :, :] + self.sumxx
+        Sigma_post = Sigma_post[None, :, :] + self.sumxx
         Sigma_post -= kappa_post[:, None, None] * np.einsum('ki,kj->kij', mu_post, mu_post)
-        # FIXME: Is there a better way to do this?
+        # Additive factor to ensure PSD
         Sigma_post += 1e-4 * np.eye(self.dim)
         self._chol = compute_cov_cholesky(Sigma_post,
                                           covariance_type=self.covariance_type)
@@ -1397,7 +1506,7 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
         self._params.update({"Sigma0": None, "kappa0": None, "nu0": None,
             "mu": None, "Sigmak": None})
         self.num_mh_steps = 20
-        self.nu0_prop_scale = 10
+        self.nu0_prop_scale = 0.1
         self.nu0_fixed = self.args.nu0_fixed
         self.use_gibbs_warmup = self.args.gibbs_warmup
         self.gibbs_warmup_iters = self.args.gibbs_warmup_iters
@@ -1410,86 +1519,115 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
             self.sumx = sumx
             self.sumxx = sumxx
             self.sample_means = sample_means
-            if self.nu0_fixed:
-                self.nu0 = float(self.args.nu0) * np.ones((self.dim))
+            self.nu0 = float(self.args.nu0) * np.ones((self.dim))
+            sumx = np.array(sumx)
+            sumxx = np.array(sumxx)
 
             # STEP 1: Estimate class-wise means and covs from sample stats and
             # uninformative priors as their respective means
-            kappa_post = self.N[:, None] + self.kappa0 # (K,D)
-            nu_post = self.N[:, None] + self.nu0 # (K,D)
-            self.mu = (self.kappa0 * self.mu0 + sumx) / kappa_post # (K,D)
-            # ((D) * (D) + (D) * (D)**2 + (K,D) - (K,D) * (K,D)**2) / (K,D) -> (K,D)
-            Sigma_post = self.nu0 * self.Sigma0 + self.kappa0 * (self.mu0 ** 2) # (D)
-            Sigma_post = Sigma_post + self.sumxx - kappa_post * (self.mu ** 2) # (K,D)
-            Sigma_post /= nu_post # (K,D)
-
-            self.Sigmak = (nu_post * Sigma_post) / (nu_post - 2) # (K,D)
+            # kappa_post = self.N[:, None] + self.kappa0 # (K,D)
+            # nu_post = self.N[:, None] + self.nu0 # (K,D)
+            # self.mu = (self.kappa0 * self.mu0 + sumx) / kappa_post # (K,D)
+            # # ((D) * (D) + (D) * (D)**2 + (K,D) - (K,D) * (K,D)**2) / (K,D) -> (K,D)
+            # Sigma_post = self.nu0 * self.Sigma0 + self.kappa0 * (self.mu0 ** 2) # (D)
+            # Sigma_post = Sigma_post + self.sumxx - kappa_post * (self.mu ** 2) # (K,D)
+            # Sigma_post /= nu_post # (K,D)
+            # self.Sigmak = (nu_post * Sigma_post) / (nu_post - 2) # (K,D)
+            # Set Sigmak and mu to sample means and covs
+            np.testing.assert_allclose(sumx / self.N[:, None], sample_means)
+            self.mu = np.array(sample_means)
+            self.Sigmak = (sumxx - (sumx ** 2) / self.N[:, None]) / (self.N - 1)[:, None]
 
             # STEP 2: Update priors: Sigma0/_priorchol, mu0, kappa0, nu0 as
             # their respective means and the MLE for nu0
+            # NOTE: Order of operations matters here:
+            # Currently we have good estimates for mu, mu0 and Sigmak
+            # 1. kappa0 depends on mu, mu0, Sigmak
+            # 2. mu0 depends on kappa0, mu, Sigmak
+            # 3. nu0 depends on Sigmak
+            # 4. Sigma0 depends on nu0, Sigmak
             K = self.N.shape[0]
             Js = 1. / self.Sigmak
             Js_sum = Js.sum(0)
             Js_sum_inv = 1. / Js_sum
-            df = K * self.nu0 + 2 # (D,)
-            print(f'Sigma0 chi-sq df = {df}')
-            scale = (df / self.nu0) * Js_sum_inv # (D,)
-            alpha = df / 2.
-            beta = df / (2. * scale)
-            self.Sigma0 = alpha / beta
-            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
-
-            # mu0 := mean(N(inv(J)h, inv(J))) = inv(J)h
-            # J := kappa0 * sum_k(prec_k)
-            # h := kappa0 * sum_k(prec_k @ mu_k)
-            J_inv_mu0 = Js_sum_inv / self.kappa0 # (D,)
-            h_mu0 = self.kappa0 * (self.mu / Js).sum(0)
-            self.mu0 = J_inv_mu0 * h_mu0
             # kappa0
             alpha = K * 0.5 + 1.
             diffs = self.mu - self.mu0
             beta = 0.5 * ((diffs ** 2) / self.Sigmak).sum(0)
             self.kappa0 = alpha / beta
-            print(f'kappa0: {self.kappa0}')
+            print(f'kappa0 mean: {self.kappa0.mean()}')
+            # mu0 := mean(N(inv(J)h, inv(J))) = inv(J)h
+            # J := kappa0 * sum_k(prec_k)
+            # h := kappa0 * sum_k(prec_k @ mu_k)
+            J_inv_mu0 = Js_sum_inv / self.kappa0 # (D,)
+            # FIXME!! BUG: mu / sigma^2
+            # h_mu0 = self.kappa0 * (self.mu / Js).sum(0)
+            h_mu0 = self.kappa0 * (self.mu / self.Sigmak).sum(0)
+            self.mu0 = J_inv_mu0 * h_mu0
             # nu0: MLE of IW (Sigma_k | nu0, Sigma0)
             # Output plot data of Loglikelihood vs MLE nu0
             if not self.nu0_fixed:
                 # MLE Sigma0 @ nu0 = inverse((1 / nu0) * mean(cluster precision))
                 print("Running MLE for nu0 and Sigma0 estimates")
                 Jbar_inv = Js_sum_inv * K
-                def calc_loglik(nu):
-                    alpha = nu / 2
-                    beta = (Jbar_inv * nu) / 2.
+                # def calc_loglik(nu):
+                #     alpha = nu / 2 # (D,)
+                #     beta = (Jbar_inv * nu) / 2. # (D,)
+                #     return -scipy.stats.invgamma(alpha, scale=1/beta).logpdf(
+                #             self.Sigmak).sum()
+                # nu0s = np.linspace(1, 1500, 1000)
+                # logliks = []
+                # for nu in tqdm(nu0s,
+                #                desc='Calculate Loglikelihoods of IX(Sigma_k | nu, Sigma)',
+                #                position=0,
+                #                leave=False,
+                #               ):
+                #     logliks.append(calc_loglik(nu))
+                # fname = 'DPGMMDiagHierarchical-nu0-Sigma0-likelihoods.pkl'
+                # fname = os.path.join(os.getcwd(), fname)
+                # if os.path.isfile(fname):
+                #     print(f'Moving old files to backup: {fname+".bkp"}')
+                #     os.rename(fname, fname+'.bkp')
+                # torch.save({
+                #     'nu0': nu0s,
+                #     'loglik': logliks,
+                # }, fname)
+                # res = scipy.optimize.minimize_scalar(calc_loglik, bounds=(1., 1200.))
+                # WAY TOO SLOWres = scipy.optimize.minimize(calc_loglik, self.nu0)
+                def calc_loglik_1d(nu, idx):
+                    alpha = nu / 2 # ()
+                    beta = (Jbar_inv[idx] * nu) / 2. # ()
                     return -scipy.stats.invgamma(alpha, scale=1/beta).logpdf(
-                            self.Sigmak).sum()
-                nu0s = np.linspace(1, 1500, 1000)
-                logliks = []
-                for nu in tqdm(nu0s,
-                               desc='Calculate Loglikelihoods of IX(Sigma_k | nu, Sigma)',
-                               position=0,
-                               leave=False,
-                              ):
-                    logliks.append(calc_loglik(nu))
-                fname = 'DPGMMDiagHierarchical-nu0-Sigma0-likelihoods.pkl'
-                fname = os.path.join(os.getcwd(), fname)
-                if os.path.isfile(fname):
-                    print(f'Moving old files to backup: {fname+".bkp"}')
-                    os.rename(fname, fname+'.bkp')
-                torch.save({
-                    'nu0': nu0s,
-                    'loglik': logliks,
-                }, fname)
-                res = scipy.optimize.minimize_scalar(calc_loglik, bounds=(1., 1200.))
-                self.nu0 = res.x
-                print(f'nu0 optimization result: {res}')
+                        self.Sigmak[:, idx]).sum() # sum over K
 
-            print(f'nu0: {self.nu0}')
+                def optimize_nu0d(idx):
+                    nu = self.nu0[idx]
+                    fun = lambda x: calc_loglik_1d(x, idx)
+                    res = scipy.optimize.minimize_scalar(fun, bounds=(1., 1200.))
+                    return res.x
+
+                # TODO: Parallelize? NOTE: The local scope makes it more
+                # difficult
+                out = []
+                for idx in range(self.nu0.shape[0]):
+                    out.append(optimize_nu0d(idx))
+                self.nu0 = np.array(out)
+            print(f'nu0 mean: {self.nu0.mean()}')
+            df = K * self.nu0 + 2 # (D,)
+            print(f'Sigma0 chi-sq df mean = {df.mean()}')
+            scale = (df / self.nu0) * Js_sum_inv # (D,)
+            # alpha = df / 2.
+            # beta = df / (2. * scale)
+            self.Sigma0 = scale
+            self._priorchol = compute_cov_cholesky(self.Sigma0, self.covariance_type)
+
             # STEP 3: Update prior/posterior predictive stats
             kappa_post = self.N[:, None] + self.kappa0
+            nu_post = self.N[:, None] + self.nu0 # (K,D)
             self.meanN = (self.kappa0 * self.mu0 + sumx) / kappa_post
             # ((D) * (D) + (D) * (D)**2 + (K,D) - (K,D) * (K,D)**2) / (K,D) -> (K,D)
             Sigma_post = self.nu0 * self.Sigma0 + self.kappa0 * (self.mu0 ** 2) # (D)
-            Sigma_post = Sigma_post + self.sumxx - kappa_post * (self.meanN ** 2) # (K,D)
+            Sigma_post = Sigma_post + sumxx - kappa_post * (self.meanN ** 2) # (K,D)
             Sigma_post /= nu_post # (K,D)
             self._chol = compute_cov_cholesky(Sigma_post, self.covariance_type)
             # Perform
@@ -1619,8 +1757,10 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
         # Compute likelihood for the data
         lls = - 0.5 * self.N.sum() * self.dim * np.log(2. * np.pi)
         lls -= 0.5 * (self.N[:, None] * np.log(self.Sigmak)).sum()
+        sumx = np.array(self.sumx)
+        sumxx = np.array(self.sumxx)
         lls -= 0.5 * ((
-            self.sumxx - 2 * self.sumx * self.mu + self.N[:, None] * self.mu ** 2
+            sumxx - 2 * sumx * self.mu + self.N[:, None] * self.mu ** 2
             ) / self.Sigmak).sum()
         lp += lls
         return lp
@@ -1631,20 +1771,22 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
         nu_N = self.nu0[:, None] + self.N  # (D, K)
         kappa_N = self.kappa0[:, None] + self.N  # (D, K)
         factor = (kappa_N + 1) / kappa_N # (D, K)
-        st = factor * (self.chol.T ** 2) # (D, K)
+        # st = factor * self.chol.T ** 2 # (D, K)
+        st = np.sqrt(factor) * self.chol.T # (D, K)
         meanN = self.meanN.T # (D, K)
         if use_torch:
             nu_N  = torch.tensor(nu_N, device=DEVICE)
             meanN  = torch.tensor(meanN, device=DEVICE)
             st = torch.tensor(st, device=DEVICE)
             return torch.distributions.StudentT(
-                nu_N, loc=meanN, scale=st).log_prob(x).sum(1) # type: ignore
+                nu_N, loc=meanN, scale=st).log_prob(x[..., None]).sum(1) # type: ignore
         return scipy.stats.t(
             nu_N, loc=meanN, scale=st).logpdf(x[..., None]).sum(1)
 
     def logpriorpred(self, x, use_torch=False):
         factor = (self.kappa0 + 1) / self.kappa0
-        st = factor * self.priorchol ** 2
+        # st = factor * self.priorchol ** 2
+        st = np.sqrt(factor) * self.priorchol
         if use_torch:
             nu0  = torch.tensor(self.nu0, device=DEVICE)
             mu0  = torch.tensor(self.mu0, device=DEVICE)
@@ -1652,7 +1794,6 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
             return torch.distributions.StudentT(
                 nu0, loc=mu0, scale=st).log_prob(x).sum(-1) # type: ignore
         return scipy.stats.t(self.nu0, loc=self.mu0, scale=st).logpdf(x).sum(-1)
-
 
 
 class SphericalDPGMMPostprocessor(DPGMM):

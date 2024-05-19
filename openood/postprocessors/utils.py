@@ -12,6 +12,7 @@ from .dpgmm_postprocessor import FullDPGMMPostprocessor
 from .dpgmm_postprocessor import DiagDPGMMPostprocessor
 from .dpgmm_postprocessor import SphericalDPGMMPostprocessor
 from .dpgmm_postprocessor import HierarchicalDPGMMPostprocessor
+from .dpgmm_postprocessor import DiagHierarchicalDPGMMPostprocessor
 from .draem_postprocessor import DRAEMPostprocessor
 from .dropout_postprocessor import DropoutPostProcessor
 from .dsvdd_postprocessor import DSVDDPostprocessor
@@ -82,6 +83,7 @@ def get_postprocessor(config: Config):
         'dpgmm_tied': TiedDPGMMPostprocessor,
         'dpgmm_tied_hierarchical': FullyBayesianTiedDPGMMPostprocessor,
         'dpgmm_hierarchical': HierarchicalDPGMMPostprocessor,
+        'dpgmm_diag_hierarchical': DiagHierarchicalDPGMMPostprocessor,
         'draem': DRAEMPostprocessor,
         'dsvdd': DSVDDPostprocessor,
         'mos': MOSPostprocessor,

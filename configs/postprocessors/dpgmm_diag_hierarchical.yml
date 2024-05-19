@@ -1,5 +1,5 @@
 postprocessor:
-  name: dpgmm_full
+  name: dpgmm_diag_hierarchical
   APS_mode: False
   postprocessor_args:
     alpha: 1e-200
@@ -9,3 +9,7 @@ postprocessor:
     kappa0: 1
     use_pca: True
     pca_dim: 64
+    nu0_fixed: False
+    nu0: 100.
+    gibbs_warmup: False
+    gibbs_warmup_iters: 100

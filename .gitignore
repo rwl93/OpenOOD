@@ -167,3 +167,11 @@ group_config/
 # local dev
 local/
 *legacy*
+
+# Vim temp files
+**.swp
+**.swo
+
+# Vit features
+vit-b-16-img1k-feats-nopreds.pkl
+vit-b-16-img1k-feats.pkl
