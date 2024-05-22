@@ -835,7 +835,7 @@ class DPGMM(BasePostprocessor):
 
     def cov_sumsqdiffmean(self):
         if self.covariance_type in ['full', 'tied']:
-            Sigma_post = np.einsum('kij,klj->kil', self.chol, self.chol) 
+            Sigma_post = np.einsum('kij,klj->kil', self.chol, self.chol)
             if self.covariance_type == 'full':
                 kappa_post = self.kappa0 + self.N
                 df = self.nu0 + self.N - self.dim + 1
@@ -1560,9 +1560,7 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
             # J := kappa0 * sum_k(prec_k)
             # h := kappa0 * sum_k(prec_k @ mu_k)
             J_inv_mu0 = Js_sum_inv / self.kappa0 # (D,)
-            # FIXME!! BUG: mu / sigma^2
-            # h_mu0 = self.kappa0 * (self.mu / Js).sum(0)
-            h_mu0 = self.kappa0 * (self.mu / self.Sigmak).sum(0)
+            h_mu0 = self.kappa0 * (self.mu * Js).sum(0)
             self.mu0 = J_inv_mu0 * h_mu0
             # nu0: MLE of IW (Sigma_k | nu0, Sigma0)
             # Output plot data of Loglikelihood vs MLE nu0
@@ -1660,7 +1658,8 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
         alpha = nu_post / 2. # (K,D)
         beta = (nu_post * Sigma_post) / 2. # (K,D)
         self.Sigmak = scipy.stats.invgamma(alpha, scale=beta).rvs() # (K,D)
-        self.mu = scipy.stats.norm(loc=mu_post, scale=self.Sigmak / kappa_post).rvs() # (K,D)
+        # FIXME XXX All scipy stats norm take scale = sqrt(Sigmak)
+        self.mu = scipy.stats.norm(loc=mu_post, scale=np.sqrt(self.Sigmak / kappa_post)).rvs() # (K,D)
 
     def sample_Sigma0(self):
         df = self.N.shape[0] * self.nu0 + 2 # (D,)
@@ -1704,7 +1703,7 @@ class DiagHierarchicalDPGMMPostprocessor(DPGMM):
         J_inv = 1. / J
         h = self.kappa0 * (self.mu / self.Sigmak).sum(0) # (D)
         J_inv_h = J_inv * h
-        self.mu0 = scipy.stats.norm(loc=J_inv_h, scale=J_inv).rvs() # (D)
+        self.mu0 = scipy.stats.norm(loc=J_inv_h, scale=np.sqrt(J_inv)).rvs() # (D)
 
     def sample_kappa0(self):
         num_clusters = self.N.shape[0]
