@@ -11,6 +11,7 @@ from .dpgmm_postprocessor import DiagDPGMMPostprocessor
 from .dpgmm_postprocessor import SphericalDPGMMPostprocessor
 from .dpgmm_postprocessor import HierarchicalDPGMMPostprocessor
 from .dpgmm_postprocessor import DiagHierarchicalDPGMMPostprocessor
+from .protodpgmm_postprocessor import ProtoDPGMMPostprocessor
 from .draem_postprocessor import DRAEMPostprocessor
 from .dropout_postprocessor import DropoutPostProcessor
 from .dsvdd_postprocessor import DSVDDPostprocessor

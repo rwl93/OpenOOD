@@ -1,0 +1,12 @@
+postprocessor:
+  name: protodpgmm
+  APS_mode: False
+  postprocessor_args:
+    latent_dim: 2
+    alpha: 1.
+    recog_scale: 1.
+    margin: 0.
+    hidden_layers: [128, 128]
+    train_epochs: 200
+    nosample: False
+    beta: 0.001
