@@ -23,6 +23,9 @@ recorder:
   name: base
   save_all_models: False
 
+trainer:
+  name: protodpmm
+
 optimizer:
   name: adam
   num_epochs: 100

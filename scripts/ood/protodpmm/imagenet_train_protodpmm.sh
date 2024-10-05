@@ -5,6 +5,6 @@ python main.py \
     configs/networks/protodpmm_net.yml \
     configs/pipelines/train/train_protodpmm.yml \
     configs/preprocessors/base_preprocessor.yml \
-    --dataset.train.batch_size 128 \
+    --dataset.train.batch_size 512 \
     --num_gpus 1 --num_workers 16 \
     --seed 0

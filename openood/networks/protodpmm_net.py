@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.distributions as dists
 import torch.nn.functional as F
+from torch import Tensor
 
 from jaxtyping import Float
 
@@ -103,7 +104,7 @@ class ProtoDPMMNet(nn.Module):
         try:
             self.data_dim = backbone.feature_size
         except AttributeError:
-            feature_size = backbone.module.feature_size
+            self.data_dim = backbone.module.feature_size
 
         self.latent_dim = latent_dim
         self.num_classes = num_classes
@@ -120,12 +121,15 @@ class ProtoDPMMNet(nn.Module):
         self.lognu0 = nn.Parameter(torch.tensor(1.), requires_grad=True)
         # Components
         self.register_buffer("N", torch.zeros(self.num_classes))
+        prior_logits = (self.alpha / self.num_classes) * torch.ones(self.num_classes)
+        prior_means = torch.rand(self.num_classes, self.latent_dim)
+        prior_covs = torch.diag_embed(torch.ones(self.num_classes, self.latent_dim))
         self.register_buffer("prior_logits", prior_logits)
         self.register_buffer("prior_means", prior_means)
         self.register_buffer("prior_covs", prior_covs)
         # Construct a recognition network to produce a Gaussian potential
         self.encoder = MLP(
-            data_dim,
+            self.data_dim,
             hidden_layers + [latent_dim],
             activation=activation
         )
@@ -170,14 +174,14 @@ class ProtoDPMMNet(nn.Module):
         D = self.latent_dim
 
         # Pass the data through the recognition network to get potential means
-        surrogate_means, surrogate_logscales = self.encoder(data)
+        surrogate_means = self.encoder(data)
         if nosample:
             return surrogate_means
         # Scale means and cov
-        if surrogate_logscales is None:
-            surrogate_scales = torch.exp(self.recog_logscale) * torch.ones(N, D, device=self.device)      # (N, D)
-        else:
-            surrogate_scales = F.softplus(surrogate_logscales) + .1
+        #if surrogate_logscales is None:
+        surrogate_scales = torch.exp(self.recog_logscale) * torch.ones(N, D, device=self.device)      # (N, D)
+        #else:
+        #    surrogate_scales = F.softplus(surrogate_logscales) + .1
         surr_cov = torch.diag_embed(surrogate_scales)                                  # (N, D, D)
         surr_dist = dists.MultivariateNormal(surrogate_means, covariance_matrix=surr_cov)
         samples = surr_dist.rsample()
@@ -220,7 +224,9 @@ class ProtoDPMMNet(nn.Module):
         """
         Compute the ELBO using reparameterization trick
         """
-        encodings = self.encode(data, nosample=nosample)
+        with torch.no_grad():
+            feats = self.backbone(data, return_feature=True)[1]
+        encodings = self.encode(feats, nosample=nosample)
         # DPMM Update
         if not nodpmmupdate:
             self.update_dpmm(encodings, labels)
@@ -247,5 +253,5 @@ class ProtoDPMMNet(nn.Module):
 
     def forward(self, data):
         feats = self.backbone(data)
-        encodings = self.encode(data, nosample=True)
+        encodings = self.encode(feats, nosample=True)
         return self.loglik(encodings)
