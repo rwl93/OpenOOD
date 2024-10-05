@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
+from torchvision.models import ViT_B_16_Weights
+from torch.hub import load_state_dict_from_url
 # from mmcls.apis import init_model
 
 import openood.utils.comm as comm
@@ -25,6 +27,7 @@ from .npos_net import NPOSNet
 from .openmax_net import OpenMax
 from .patchcore_net import PatchcoreNet
 from .projection_net import ProjectionNet
+from .protodpmm_net import ProtoDPMMNet
 from .react_net import ReactNet
 from .resnet18_32x32 import ResNet18_32x32
 from .resnet18_64x64 import ResNet18_64x64
@@ -349,6 +352,9 @@ def get_network(network_config):
         net = {'encoder': encoder, 'bn': bn, 'decoder': decoder}
     elif network_config.name == 'protodpmm_net':
         backbone = get_network(network_config.backbone)
+        weights = ViT_B_16_Weights.IMAGENET1K_V1
+        backbone.load_state_dict(load_state_dict_from_url(weights.url))
+        #preprocessor = weights.transforms()
         net = ProtoDPMMNet(backbone,
                            network_config.latent_dim,
                            num_classes,

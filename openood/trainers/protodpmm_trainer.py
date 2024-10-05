@@ -1,3 +1,5 @@
+from tqdm import tqdm
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -18,8 +20,8 @@ class ProtoDPMMTrainer:
         self.net = net
         self.train_loader = train_loader
         self.config = config
-        self.optimmizer = torch.optim.Adam(
-            net.parameters()
+        self.optimizer = torch.optim.Adam(
+            net.parameters(),
             config.optimizer.lr,
             weight_decay = config.optimizer.weight_decay,
         )
@@ -30,8 +32,7 @@ class ProtoDPMMTrainer:
         loss_avg = 0.0
         train_dataiter = iter(self.train_loader)
 
-        for train_step in tqdm(range(1,
-                                     len(train_dataiter) + 1),
+        for train_step in tqdm(range(1, len(train_dataiter) + 1),
                                desc='Epoch {:03d}: '.format(epoch_idx),
                                position=0,
                                leave=True,
@@ -45,7 +46,7 @@ class ProtoDPMMTrainer:
                                  nosample=self.config.loss.nosample,
                                  nodpmmupdate=False,
                                  beta=self.config.loss.beta,
-                                ):
+                                )
 
             # backward
             self.optimizer.zero_grad()
