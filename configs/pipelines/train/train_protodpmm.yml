@@ -1,0 +1,34 @@
+exp_name: "'@{dataset.name}'_'@{network.name}'_'@{trainer.name}'_e'@{optimizer.num_epochs}'_lr'@{optimizer.lr}'_'@{mark}'/s'@{seed}'"
+output_dir: ./results/
+save_output: True
+merge_option: default
+mark: default
+seed: 0
+
+num_gpus: 1
+num_workers: 8
+num_machines: 1
+machine_rank: 0
+
+evaluator:
+  name: base
+
+preprocessor:
+  name: base
+
+pipeline:
+  name: train
+
+recorder:
+  name: base
+  save_all_models: False
+
+optimizer:
+  name: adam
+  num_epochs: 100
+  lr: 0.01
+  weight_decay: 0.0001
+
+loss:
+  nosample: False
+  beta: 0.001

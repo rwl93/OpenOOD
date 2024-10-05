@@ -347,6 +347,16 @@ def get_network(network_config):
         bn = BN_layer(AttnBasicBlock, 2)
         decoder = De_ResNet18_256x256()
         net = {'encoder': encoder, 'bn': bn, 'decoder': decoder}
+    elif network_config.name == 'protodpmm_net':
+        backbone = get_network(network_config.backbone)
+        net = ProtoDPMMNet(backbone,
+                           network_config.latent_dim,
+                           num_classes,
+                           network_config.recog_scale,
+                           hidden_layers=network_config.hidden_layers,
+                           margin=network_config.margin,
+                           alpha=network_config.alpha,
+                          )
     else:
         raise Exception('Unexpected Network Architecture!')
 

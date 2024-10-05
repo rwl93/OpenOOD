@@ -1,0 +1,19 @@
+network:
+  name: protodpmm_net
+  num_classes: '@{dataset.num_classes}'
+  num_gpus: 1
+  pretrained: False
+  checkpoint: none
+
+  latent_dim: 2
+  hidden_layers: [128, 128]
+  margin: 0.
+  recog_logscale: 1.
+  alpha: 1.
+
+  backbone:
+    name: 'vit-b-16'
+    num_classes: '@{dataset.num_classes}'
+    pretrained: True
+    checkpoint: ./checkpoints/vit-base-p16_in21k-pre-3rdparty_ft-64xb64_in1k-384_20210928-98e8652b.pth         # ignore if pretrained is false
+    num_gpus: 1
