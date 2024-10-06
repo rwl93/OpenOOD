@@ -267,6 +267,8 @@ class ProtoDPGMMPostprocessor(BasePostprocessor):
         self.train_epochs = int(self.args.train_epochs)
         self.nosample = self.args.nosample
         self.beta = float(self.args.beta)
+        self.lr = float(self.args.lr)
+        self.weight_decay = float(self.args.weight_decay)
 
     @torch.no_grad()
     def postprocess(self, net: nn.Module, data: Any, from_feats: bool = False):
@@ -333,15 +335,20 @@ class ProtoDPGMMPostprocessor(BasePostprocessor):
                 alpha=self.alpha,
                 activation=nn.Tanh,
             )
+            self.protonet = self.protonet.to("cuda")
+            optimizer = torch.optim.Adam(
+                self.protonet.parameters()
+                self.lr,
+                weight_decay=self.weight_decay)
 
             self.protonet.train()
             # Train loop
             for epoch in trange(self.train_epochs):
                 loss = self.protonet.loss(
                     feats, labels, nosample=self.nosample, beta=self.beta)
-                self.optimizer.zero_grad()
+                optimizer.zero_grad()
                 loss.backward()
-                self.optimizer.step()
+                optimizer.step()
                 print(f"{epoch}: {float(loss)}")
 
             self.protonet.eval()

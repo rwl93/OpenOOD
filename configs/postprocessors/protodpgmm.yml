@@ -10,3 +10,5 @@ postprocessor:
     train_epochs: 200
     nosample: False
     beta: 0.001
+    lr: 0.01
+    weight_decay: 0.0001
